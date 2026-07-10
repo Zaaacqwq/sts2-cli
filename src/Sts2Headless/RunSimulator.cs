@@ -2936,12 +2936,24 @@ public class RunSimulator
             var executor = RunManager.Instance.ActionExecutor;
             if (executor.IsRunning)
             {
-                // Pump while waiting for executor
-                int maxPumps = 1000;
-                for (int i = 0; i < maxPumps; i++)
+                // Pump while waiting for executor, bounded by wall-clock time rather than
+                // an iteration count. The loop used to spin a fixed 1000 iterations of
+                // Thread.Sleep(1), intending a ~1s budget — but Windows' default timer
+                // resolution rounds Sleep(1) up to ~15.6ms, so it actually spun for ~15.6s.
+                // DetectDecisionPoint() calls WaitForActionExecutor() a second time right
+                // after the action handler's own call, so a single stuck executor.IsRunning
+                // (observed permanently true for the rest of the episode once a second
+                // nested card selection — e.g. Necrobinder Snap, Regent Begone — resolves
+                // before the first one's effects finish committing) burned ~31s total per
+                // action and blew past the CLI client's 10s response timeout, even though
+                // the underlying game state was already valid and DetectDecisionPoint's own
+                // downstream serialization works fine once this loop gives up.
+                var deadline = System.Diagnostics.Stopwatch.StartNew();
+                while (deadline.ElapsedMilliseconds < 1000)
                 {
                     _syncCtx.Pump();
                     if (!executor.IsRunning) break;
+                    if (_cardSelector.HasPending || _cardSelector.HasPendingReward) break;
                     Thread.Sleep(1);
                 }
             }
