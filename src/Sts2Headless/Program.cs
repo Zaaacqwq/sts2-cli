@@ -114,12 +114,20 @@ class Program
         switch (cmdType)
         {
             case "start_run":
-                return sim.StartRun(
-                    cmd.TryGetProperty("character", out var ch) ? ch.GetString() ?? "Ironclad" : "Ironclad",
-                    cmd.TryGetProperty("ascension", out var asc) ? asc.GetInt32() : 0,
-                    cmd.TryGetProperty("seed", out var s) ? s.GetString() : null,
-                    cmd.TryGetProperty("lang", out var lang) ? lang.GetString() ?? "en" : "en"
-                );
+            {
+                var character = cmd.TryGetProperty("character", out var ch) ? ch.GetString() ?? "Ironclad" : "Ironclad";
+                var ascension = cmd.TryGetProperty("ascension", out var asc) ? asc.GetInt32() : 0;
+                var seed = cmd.TryGetProperty("seed", out var s) ? s.GetString() : null;
+                var language = cmd.TryGetProperty("lang", out var lang) ? lang.GetString() ?? "en" : "en";
+                var result = sim.StartRun(
+                    character, ascension, seed, language);
+                // STS2 v0.107.1 completes ModManager lazily during the first
+                // RunState creation. Retry transparently after that warm-up.
+                if (result.TryGetValue("message", out var message) &&
+                    message is string text && text.Contains("ModManager is not finished initializing"))
+                    result = sim.StartRun(character, ascension, seed, language);
+                return result;
+            }
 
             case "action":
             {

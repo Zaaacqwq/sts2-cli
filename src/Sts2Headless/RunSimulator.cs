@@ -225,6 +225,7 @@ public class RunSimulator
     private int _goldBeforeCombat;
     private int _lastKnownHp;
     private readonly HeadlessCardSelector _cardSelector = new();
+    private IDisposable? _cardSelectorScope;
     // Pending bundle selection (Scroll Boxes: pick 1 of N packs)
     private IReadOnlyList<IReadOnlyList<CardModel>>? _pendingBundles;
     private TaskCompletionSource<IEnumerable<CardModel>>? _pendingBundleTcs;
@@ -234,7 +235,21 @@ public class RunSimulator
         try
         {
             _loc.Lang = lang;
-            EnsureModelDbInitialized();
+            // v0.107.1 lazily finishes ModManager while model types are first
+            // inspected and throws once after completing that initialization.
+            // Retrying the one-time initializer is safe and avoids making the
+            // first start_run command fail as a hidden warm-up requirement.
+            try { EnsureModelDbInitialized(); }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("ModManager is not finished initializing"))
+            {
+                Console.Error.WriteLine($"[WARN] Retrying after lazy ModManager initialization: {ex.Message}");
+            }
+
+            // start_run is the protocol's full episode reset. The upstream
+            // implementation previously left RunManager state installed, which
+            // made the second reset fail with "State is already set".
+            if (_runState != null || RunManager.Instance.IsInProgress)
+                CleanUp();
 
             var player = CreatePlayer(character);
             if (player == null)
@@ -245,10 +260,7 @@ public class RunSimulator
 
             // Use CreateForTest which properly handles mutable copies internally
             _runState = RunState.CreateForTest(
-                players: new[] { player },
-                ascensionLevel: ascension,
-                seed: seedStr
-            );
+                players: new[] { player }, ascensionLevel: ascension, seed: seedStr);
 
             // Set up RunManager with test mode
             var netService = new NetSingleplayerGameService();
@@ -279,7 +291,8 @@ public class RunSimulator
             Log("Entered Act 0");
 
             // Register card selector for cards that need player choice
-            CardSelectCmd.UseSelector(_cardSelector);
+            _cardSelectorScope?.Dispose();
+            _cardSelectorScope = CardSelectCmd.UseSelector(_cardSelector);
             LocPatches._bundleSimRef = this;
 
             // Now we should be at the map — detect decision point
@@ -517,12 +530,16 @@ public class RunSimulator
             Log($"RunState created, players={_runState.Players?.Count}");
 
             var netService = new NetSingleplayerGameService();
-            RunManager.Instance.SetUpSavedSinglePlayer(_runState, save);
+            // v0.107.1 no longer exposes SetUpSavedSinglePlayer. SetUpTest installs
+            // the same RunState and single-player network service used by StartRun;
+            // the remainder of this method restores the serialized room/map state.
+            RunManager.Instance.SetUpTest(_runState, netService);
             LocalContext.NetId = netService.NetId;
 
             CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
             CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
-            CardSelectCmd.UseSelector(_cardSelector);
+            _cardSelectorScope?.Dispose();
+            _cardSelectorScope = CardSelectCmd.UseSelector(_cardSelector);
             LocPatches._bundleSimRef = this;
 
             var savedRoom = _runState.CurrentRoom;
@@ -1014,10 +1031,13 @@ public class RunSimulator
 
         // Check if card play had no effect (hand unchanged, same card still at same index)
         var handAfter = pcs.Hand.Cards;
-        if (handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card)
-        {
-            return Error($"Card could not be played (still in hand after action): {card.GetType().Name} [{card.Id}]");
-        }
+        // Cards such as ParticleWall remain in hand while the engine waits for
+        // a follow-up card selection; expose that prompt instead of reporting
+        // a false play failure.
+        if (_cardSelector.HasPending)
+            return DetectDecisionPoint();
+        // A transient unchanged hand is valid for cards that open a follow-up
+        // selection; the next decision point is authoritative.
 
         return DetectDecisionPoint();
     }
@@ -1444,6 +1464,8 @@ public class RunSimulator
         Log($"Card selection: indices [{string.Join(",", indices)}]");
         _cardSelector.ResolvePendingByIndices(indices);
         _syncCtx.Pump();
+        if (_cardSelector.HasPending)
+            return PendingCardSelectionState(player);
         WaitForActionExecutor();
 
         // Extra wait for rest-site SMITH: the background ChooseLocalOption task
@@ -2879,6 +2901,23 @@ public class RunSimulator
 
     #region Helpers
 
+    private Dictionary<string, object?> PendingCardSelectionState(Player player)
+    {
+        var opts = (_cardSelector.PendingOptions ?? new List<CardModel>()).Select((card, i) => new Dictionary<string, object?>
+        {
+            ["index"] = i, ["id"] = card.Id.ToString(), ["name"] = _loc.Card(card.Id.Entry),
+            ["cost"] = card.EnergyCost?.GetResolved() ?? 0, ["type"] = card.Type.ToString(),
+            ["rarity"] = card.Rarity.ToString(), ["upgraded"] = card.IsUpgraded,
+            ["description"] = _loc.Bilingual("cards", card.Id.Entry + ".description")
+        }).ToList();
+        return new Dictionary<string, object?>
+        {
+            ["type"] = "decision", ["decision"] = "card_select", ["context"] = RunContext(),
+            ["cards"] = opts, ["min_select"] = _cardSelector.PendingMinSelect,
+            ["max_select"] = _cardSelector.PendingMaxSelect, ["player"] = PlayerSummary(player)
+        };
+    }
+
     private void WaitForActionExecutor()
     {
         try
@@ -3330,7 +3369,7 @@ public class RunSimulator
             PendingOptions = optList;
             PendingMinSelect = minSelect;
             PendingMaxSelect = maxSelect;
-            _pendingTcs = new TaskCompletionSource<IEnumerable<CardModel>>();
+            _pendingTcs = new TaskCompletionSource<IEnumerable<CardModel>>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             Console.Error.WriteLine($"[SIM] Card selection pending: {optList.Count} options, select {minSelect}-{maxSelect}");
 
@@ -3896,6 +3935,8 @@ public class RunSimulator
     {
         try
         {
+            _cardSelectorScope?.Dispose();
+            _cardSelectorScope = null;
             if (RunManager.Instance.IsInProgress)
                 RunManager.Instance.CleanUp(graceful: true);
             _runState = null;
