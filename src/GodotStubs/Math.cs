@@ -139,6 +139,8 @@ public static class Mathf
     public static float Clamp(float value, float min, float max) => Math.Clamp(value, min, max);
     public static int Clamp(int value, int min, int max) => Math.Clamp(value, min, max);
     public static float Lerp(float from, float to, float weight) => from + (to - from) * weight;
+    public static float LinearToDb(float linear) => MathF.Log(linear) * 8.685889638065037f;
+    public static float DbToLinear(float db) => MathF.Exp(db * 0.11512925464970228f);
     public static float DegToRad(float deg) => deg * (Pi / 180f);
     public static float RadToDeg(float rad) => rad * (180f / Pi);
     public static float Sign(float s) => MathF.Sign(s);

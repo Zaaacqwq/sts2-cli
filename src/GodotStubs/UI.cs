@@ -299,6 +299,19 @@ public class Timer : Node
 }
 
 // Audio
+// NDebugAudioManager.SetMasterAudioVolume/SetSfxAudioVolume call
+// AudioServer.Singleton.GetBusIndex/SetBusVolumeDb. Harmony resolves every
+// member token in a patched method body, so these members must exist even
+// though headless never routes audio.
+public class AudioServerInstance : GodotObject
+{
+    public int GetBusIndex(StringName busName) => 0;
+    public void SetBusVolumeDb(int busIdx, float volumeDb) { }
+}
+public static class AudioServer
+{
+    public static AudioServerInstance Singleton { get; } = new();
+}
 public class AudioStream : Resource { }
 public class AudioStreamPlayer : Node
 {
