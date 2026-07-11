@@ -2,8 +2,8 @@ namespace Sts2Headless;
 
 /// <summary>
 /// Drives the engine-owned continuation queue to a stable command boundary.
-/// Completion is based on observable work (FIFO callbacks and external-input
-/// prompts), never ActionExecutor.IsRunning, whose counter can remain latched.
+/// A missed boundary poisons the dispatcher: returning a half-applied state is
+/// never a valid recovery strategy for an RL environment.
 /// </summary>
 internal sealed class Quiescence
 {
@@ -20,34 +20,65 @@ internal sealed class Quiescence
     {
         var budget = System.Diagnostics.Stopwatch.StartNew();
         var lastWork = budget.ElapsedMilliseconds;
-        while (budget.ElapsedMilliseconds < budgetMilliseconds)
+        try
         {
-            if (_externalInputPending()) return;
-            if (_dispatcher.RunOne(1))
+            while (budget.ElapsedMilliseconds < budgetMilliseconds)
             {
-                lastWork = budget.ElapsedMilliseconds;
-                continue;
+                if (_externalInputPending()) return;
+                if (_dispatcher.RunOne(1))
+                {
+                    lastWork = budget.ElapsedMilliseconds;
+                    continue;
+                }
+                if (!_dispatcher.HasPending &&
+                    budget.ElapsedMilliseconds - lastWork >= quietMilliseconds)
+                    return;
             }
-            if (!_dispatcher.HasPending && budget.ElapsedMilliseconds - lastWork >= quietMilliseconds)
-                return;
         }
+        catch (EngineFatalException) { throw; }
+        catch (Exception ex)
+        {
+            throw _dispatcher.Poison(
+                "dispatcher_callback_fault",
+                $"engine continuation failed: {ex.GetType().Name}: {ex.Message}",
+                ex);
+        }
+
+        throw _dispatcher.Poison(
+            "quiescence_timeout",
+            $"engine did not reach quiescence within {budgetMilliseconds}ms " +
+            $"(pending={_dispatcher.HasPending}, external_input={_externalInputPending()})");
     }
 
     /// <summary>
-    /// Transitional bridge for deep synchronous call sites. It drains at this one
-    /// helper rather than blocking the engine thread on a continuation that must run
-    /// on that same thread. False means the operation suspended for external input.
+    /// Transitional bridge for deep synchronous call sites. It drains FIFO work
+    /// while waiting and returns false only when the operation has deliberately
+    /// suspended for external input.
     /// </summary>
     public bool RunInline(Task task, int budgetMilliseconds = 2000)
     {
         var budget = System.Diagnostics.Stopwatch.StartNew();
-        while (!task.IsCompleted && budget.ElapsedMilliseconds < budgetMilliseconds)
+        try
         {
-            if (_externalInputPending()) return false;
-            _dispatcher.RunOne(1);
+            while (!task.IsCompleted && budget.ElapsedMilliseconds < budgetMilliseconds)
+            {
+                if (_externalInputPending()) return false;
+                _dispatcher.RunOne(1);
+            }
+            if (!task.IsCompleted)
+                throw _dispatcher.Poison(
+                    "engine_task_timeout",
+                    $"engine task did not complete within {budgetMilliseconds}ms");
+            task.GetAwaiter().GetResult();
+            return true;
         }
-        if (!task.IsCompleted) throw new TimeoutException("engine task did not reach quiescence");
-        task.GetAwaiter().GetResult();
-        return true;
+        catch (EngineFatalException) { throw; }
+        catch (Exception ex)
+        {
+            throw _dispatcher.Poison(
+                "engine_task_fault",
+                $"engine task failed: {ex.GetType().Name}: {ex.Message}",
+                ex);
+        }
     }
 }

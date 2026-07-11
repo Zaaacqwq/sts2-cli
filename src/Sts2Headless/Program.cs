@@ -72,6 +72,12 @@ class Program
             return null;
         };
 
+        if (args.Contains("--self-test-dispatcher"))
+        {
+            DispatcherSelfTest.Run();
+            return;
+        }
+
         // All game-engine state lives on a single dedicated thread. Construct the
         // simulator there too so no engine object is ever touched from two threads.
         using var engine = new EngineThread();
@@ -85,14 +91,36 @@ class Program
             if (string.IsNullOrEmpty(line)) continue;
 
             Dictionary<string, object?>? result;
+            var fatal = false;
             try
             {
                 var cmd = JsonSerializer.Deserialize<JsonElement>(line);
-                result = engine.Invoke(() => HandleCommand(sim, cmd));
+                result = engine.Invoke(() =>
+                {
+                    sim.ThrowIfEngineFatal();
+                    var response = HandleCommand(sim, cmd);
+                    // Deep legacy handlers still contain narrow catch blocks. A poison
+                    // check here makes it impossible for one of them to turn a fatal
+                    // dispatcher failure back into a healthy-looking decision response.
+                    sim.ThrowIfEngineFatal();
+                    return response;
+                });
             }
             catch (JsonException ex)
             {
                 result = new Dictionary<string, object?> { ["type"] = "error", ["message"] = $"Invalid JSON: {ex.Message}" };
+            }
+            catch (EngineFatalException ex)
+            {
+                fatal = true;
+                Console.Error.WriteLine($"[FATAL] {ex}");
+                result = new Dictionary<string, object?>
+                {
+                    ["type"] = "error",
+                    ["fatal"] = true,
+                    ["code"] = ex.Code,
+                    ["message"] = ex.Message,
+                };
             }
             catch (Exception ex)
             {
@@ -102,6 +130,7 @@ class Program
             if (result != null)
             {
                 WriteLine(result);
+                if (fatal) break;
                 if (result.TryGetValue("type", out var resultTypeObj) &&
                     string.Equals(resultTypeObj as string, "quit_result", StringComparison.Ordinal))
                 {

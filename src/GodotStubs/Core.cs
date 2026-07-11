@@ -9,6 +9,10 @@ public class GodotObject
     public static bool IsInstanceValid(GodotObject? obj) => obj != null;
     public virtual bool IsQueuedForDeletion() => false;
 
+    // NDebugAudioManager.Play references signal wiring. Harmony resolves every
+    // member token before replacing that presentation-only method with a no-op.
+    public Error Connect(StringName signal, Callable callable, uint flags = 0) => Error.Ok;
+
     // ToSignal - must be on GodotObject (not Node) to match real Godot
     public SignalAwaiter ToSignal(GodotObject source, StringName signal)
     {

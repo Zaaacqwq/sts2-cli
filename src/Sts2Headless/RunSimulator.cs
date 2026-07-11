@@ -218,8 +218,20 @@ public class RunSimulator
         if (_cardSelector.HasPending || _cardSelector.HasPendingReward ||
             (_pendingBundleTcs != null && !_pendingBundleTcs.Task.IsCompleted))
             return;
-        if (_quiescence.RunInline(task, 5000))
+        try
+        {
+            if (_quiescence.RunInline(task, 5000))
+                _pendingExternalTask = null;
+        }
+        catch
+        {
+            // A faulted bridge task rethrows from GetResult() on every await, so leaving it
+            // pending re-reports one dead event option on unrelated later commands. Drop it
+            // and let the caller surface the failure once. Until now this was only cleared
+            // by accident, when the next bridge overwrote the slot in TrackExternalTask.
             _pendingExternalTask = null;
+            throw;
+        }
     }
 
     public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null, string lang = "en")
@@ -2925,11 +2937,20 @@ public class RunSimulator
             ResumeExternalTask();
             _quiescence.DrainUntilQuiet();
         }
+        catch (EngineFatalException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
-            Log($"WaitForActionExecutor exception: {ex.Message}");
+            throw _syncCtx.Poison(
+                "engine_unsettled",
+                $"engine failed while reaching a stable boundary: {ex.GetType().Name}: {ex.Message}",
+                ex);
         }
     }
+
+    public void ThrowIfEngineFatal() => _syncCtx.ThrowIfPoisoned();
 
     private void SpinWaitForCombatStable()
     {
@@ -3135,6 +3156,12 @@ public class RunSimulator
         // moves (e.g. BygoneEffigy.WakeMove) NRE in headless and break the enemy turn.
         PatchTalkCmd();
 
+        // Audio, waits and one event rumble are presentation-only. Patch their exact
+        // call surfaces without making the global NGame singleton non-null.
+        HeadlessPresentation.Install();
+
+        InstallHeadlessRewardSelector();
+
         // Initialize localization system (needed for events, cards, etc.)
         InitLocManager();
 
@@ -3252,6 +3279,26 @@ public class RunSimulator
         {
             Console.Error.WriteLine($"[WARN] Failed to patch Cmd.Wait: {ex.Message}");
         }
+    }
+
+    private static void InstallHeadlessRewardSelector()
+    {
+        RewardsSet.testSelector = async set =>
+        {
+            var synchronizer = RunManager.Instance.RewardsSetSynchronizer;
+            foreach (var reward in set.Rewards)
+            {
+                if (await synchronizer.SelectLocalReward(reward)) continue;
+                if (set.DisallowSkipping)
+                    throw new InvalidOperationException(
+                        $"required reward could not be selected: {reward.GetType().Name}");
+
+                // A full potion belt is a normal UI outcome: keep rewards already
+                // taken, mark the remaining choices skipped, and complete the set.
+                synchronizer.SkipLocalRewardsSet();
+                return;
+            }
+        };
     }
 
     private static void PatchTalkCmd()

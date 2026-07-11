@@ -67,6 +67,21 @@ the entire class of re-entrancy / ordering bugs.
 corruptible `ActionExecutor.IsRunning` flag is never consulted. Nested selection cannot
 invert because inner continuations are only dequeued *after* outer ones, on one thread.
 
+### Fail-closed poisoning
+
+An empty-looking queue is only trusted when it reaches the quiet window within the
+wall-clock budget. A quiescence timeout, `RunInline` timeout/fault, dispatcher callback
+fault, or cross-thread `Send` timeout permanently poisons the dispatcher:
+
+- queued callbacks are atomically cancelled and cannot start later;
+- `Post`, `Send`, `RunOne`, and command-boundary checks all throw the same fatal error;
+- the CLI emits `{type:"error", fatal:true, code:...}` and stops reading commands;
+- the Python client kills the process group and the next reset starts a fresh worker.
+
+This deliberately abandons the episode rather than serializing a potentially half-applied
+state. `Send` uses a five-second bound; timeout never leaves a callback that can become a
+late "ghost" state mutation.
+
 ### Deadlock resolution (the core risk)
 
 Under a pure FIFO dispatcher, a naive `task.GetAwaiter().GetResult()` on the engine thread
@@ -109,6 +124,10 @@ suspend/resume round-trips, each resumed in order.
 - `EngineThread.cs` — dedicated thread, inbox, message loop.
 - `SingleThreadDispatcher.cs` — FIFO synchronization context.
 - `Quiescence.cs` — quiescence detection + `RunInline` helper.
+- `EngineFatalException.cs` — typed fatal reason carried through the CLI protocol.
+- `DispatcherSelfTest.cs` — deterministic timeout/queue-cancellation poison checks.
+- `HeadlessPresentation.cs` — narrow audio/wait/rumble patches; it intentionally never
+  makes the global `NGame.Instance` non-null.
 
 ## Phases (each validated with the 3 reproducing seeds)
 
@@ -150,6 +169,15 @@ suspend/resume round-trips, each resumed in order.
       `game_over`, 0 timeouts, 0 protocol errors, 0 non-terminating episodes, 280.0 seconds
       with 6 workers. Reset determinism matched across repeated, interleaved-character, and
       separate-worker runs; no orphan engine processes remained.
+- [x] **Post-P5 hardening** Quiescence and `Send` now fail closed through dispatcher poison.
+      Instrumentation exposed three previously swallowed real-engine faults:
+      `DenseVegetation.Rest`, `JungleMazeAdventure.SafetyInNumbers`, and a full-belt
+      `WhisperingHollow` potion reward. Presentation calls are patched at their narrow call
+      surfaces (without a global `NGame` stub), and an unselectable optional reward now skips
+      the remaining reward set with already-claimed rewards preserved. The poison-enabled
+      200-episode preflight returned 200/200 `game_over`; the final six-worker P5 returned
+      **1000/1000** `game_over`, 0 fatal errors/timeouts/protocol errors/non-terminals in
+      273.0 seconds.
 
 ## Note on the original diagnosis
 
