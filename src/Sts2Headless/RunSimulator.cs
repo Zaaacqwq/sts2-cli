@@ -205,6 +205,32 @@ internal class LocLookup
 /// </summary>
 public class RunSimulator
 {
+    /// <summary>
+    /// Constructed on the single engine thread (see EngineThread). Pin our sync context
+    /// as current so every async continuation — including Task.Yield — posts here and is
+    /// driven by the pump loop, never escaping to the thread pool. This is what lets the
+    /// former Task.Run "escapes" run inline on one thread. See docs/SINGLE_THREAD_DRIVER.md.
+    /// </summary>
+    public RunSimulator()
+    {
+        SynchronizationContext.SetSynchronizationContext(_syncCtx);
+    }
+
+    /// <summary>
+    /// Drive an in-flight engine Task to completion on this (engine) thread by pumping
+    /// the sync context. Replaces Task.Wait(...) / thread-pool escapes so an async engine
+    /// operation never has to complete on another thread. Bounded by a wall-clock budget.
+    /// </summary>
+    private void DrainUntilComplete(Task task, int budgetMs = 2000)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!task.IsCompleted && sw.ElapsedMilliseconds < budgetMs)
+        {
+            _syncCtx.Pump();
+            if (!task.IsCompleted) Thread.Sleep(1);
+        }
+    }
+
     private static int? _expectedSaveSchemaVersion;
     private static bool _expectedSaveSchemaVersionReady;
     private static readonly object _expectedSaveSchemaVersionLock = new();
@@ -1183,18 +1209,16 @@ public class RunSimulator
                     _syncCtx.Pump();
                     Thread.Sleep(50);
 
-                    // Run EndTurn on ThreadPool with SuppressYield permanently on
+                    // Retry EndTurn inline on the engine thread with SuppressYield on — no
+                    // thread pool, so nothing races with the engine thread. If it still can't
+                    // settle within the budget we fall through to the force-game_over escape.
                     YieldPatches.SuppressYield = true;
-                    var endTurnTask = Task.Run(() =>
-                    {
-                        PlayerCmd.EndTurn(player, canBackOut: false);
-                    });
+                    PlayerCmd.EndTurn(player, canBackOut: false);
 
                     // Aggressively pump sync context while waiting (up to 5 seconds)
                     for (int i = 0; i < 500; i++)
                     {
                         _syncCtx.Pump();
-                        if (endTurnTask.IsCompleted) break;
                         if (_turnStarted.IsSet || _combatEnded.IsSet) break;
                         if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
                         if (IsPlayPhase()) break;
@@ -1348,7 +1372,9 @@ public class RunSimulator
             // pending selection appears so the caller can resolve it; the background task
             // continues once the selector's TCS is fed by select_cards.
             var inv = merchantRoom.GetLocalInventory();
-            var task = Task.Run(() => entry.OnTryPurchaseWrapper(inv));
+            // Runs inline on the engine thread; suspends on the selection TCS if the pickup
+            // opens a card_select, and resumes when select_cards feeds it. No thread pool.
+            var task = entry.OnTryPurchaseWrapper(inv);
             for (int i = 0; i < 100; i++)
             {
                 _syncCtx.Pump();
@@ -1362,7 +1388,7 @@ public class RunSimulator
                 Log($"Buy relic {entry.Model.GetType().Name}: yielded for pending selection");
                 return DetectDecisionPoint();
             }
-            if (!task.IsCompleted) task.Wait(2000);
+            DrainUntilComplete(task);
             _syncCtx.Pump();
             Log($"Bought relic: {entry.Model.GetType().Name} for {entry.Cost}g");
         }
@@ -1413,7 +1439,7 @@ public class RunSimulator
         try
         {
             // Run on background thread so card selection can pause (same pattern as event options)
-            var task = Task.Run(() => removal.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()));
+            var task = removal.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory());
             for (int i = 0; i < 100; i++)
             {
                 _syncCtx.Pump();
@@ -1426,7 +1452,7 @@ public class RunSimulator
                 WaitForActionExecutor();
                 return DetectDecisionPoint();
             }
-            if (!task.IsCompleted) task.Wait(2000);
+            DrainUntilComplete(task);
             _syncCtx.Pump();
             Log($"Removed card for {removal.Cost}g");
         }
@@ -1627,7 +1653,7 @@ public class RunSimulator
             try
             {
                 // Run on background thread so Smith card selection can pause
-                var task = Task.Run(() => RunManager.Instance.RestSiteSynchronizer.ChooseLocalOption(optionIndex));
+                var task = RunManager.Instance.RestSiteSynchronizer.ChooseLocalOption(optionIndex);
                 for (int i = 0; i < 100; i++)
                 {
                     _syncCtx.Pump();
@@ -1640,7 +1666,7 @@ public class RunSimulator
                     WaitForActionExecutor();
                     return DetectDecisionPoint();
                 }
-                if (!task.IsCompleted) task.Wait(2000);
+                DrainUntilComplete(task);
                 _syncCtx.Pump();
             }
             catch (Exception ex)
@@ -1680,7 +1706,7 @@ public class RunSimulator
                         _eventOptionChosen = true;
                         _lastEventOptionCount = options.Count;
                         // Run on thread pool so GetSelectedCards/GetSelectedCardReward can block
-                        var task = Task.Run(() => options[optionIndex].Chosen());
+                        var task = options[optionIndex].Chosen();
                         for (int i = 0; i < 100; i++)
                         {
                             _syncCtx.Pump();
@@ -1694,7 +1720,7 @@ public class RunSimulator
                             WaitForActionExecutor();
                             return DetectDecisionPoint();
                         }
-                        if (!task.IsCompleted) task.Wait(2000);
+                        DrainUntilComplete(task);
                         _syncCtx.Pump();
                     }
                     catch (Exception ex) { Log($"Event choose: {ex.Message}"); }
