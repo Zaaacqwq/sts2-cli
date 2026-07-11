@@ -32,62 +32,6 @@ using MegaCrit.Sts2.Core.Unlocks;
 namespace Sts2Headless;
 
 /// <summary>
-/// Synchronization context that executes continuations inline immediately.
-/// Task.Yield() posts to SynchronizationContext.Current — by executing inline,
-/// the yield becomes a no-op and the entire async chain runs synchronously.
-/// Uses a recursion guard to queue nested posts and drain them after.
-/// </summary>
-internal class InlineSynchronizationContext : SynchronizationContext
-{
-    private readonly Queue<(SendOrPostCallback, object?)> _queue = new();
-    private bool _executing;
-
-    public override void Post(SendOrPostCallback d, object? state)
-    {
-        if (_executing)
-        {
-            _queue.Enqueue((d, state));
-            return;
-        }
-        // removed debug log
-
-        // Execute inline immediately, then drain any nested posts
-        _executing = true;
-        try
-        {
-            d(state);
-            // Drain any callbacks that were queued during execution
-            while (_queue.Count > 0)
-            {
-                var (cb, st) = _queue.Dequeue();
-                cb(st);
-            }
-        }
-        finally
-        {
-            _executing = false;
-        }
-    }
-
-    public override void Send(SendOrPostCallback d, object? state)
-    {
-        d(state);
-    }
-
-    public void Pump()
-    {
-        // Drain any remaining queued callbacks
-        while (_queue.Count > 0)
-        {
-            var (cb, st) = _queue.Dequeue();
-            _executing = true;
-            try { cb(st); }
-            finally { _executing = false; }
-        }
-    }
-}
-
-/// <summary>
 /// Bilingual localization lookup — loads eng/zhs JSON files for display names.
 /// </summary>
 internal class LocLookup
@@ -207,13 +151,16 @@ public class RunSimulator
 {
     /// <summary>
     /// Constructed on the single engine thread (see EngineThread). Pin our sync context
-    /// as current so every async continuation — including Task.Yield — posts here and is
-    /// driven by the pump loop, never escaping to the thread pool. This is what lets the
-    /// former Task.Run "escapes" run inline on one thread. See docs/SINGLE_THREAD_DRIVER.md.
+    /// as current so every captured async continuation posts to a strict FIFO queue
+    /// instead of executing re-entrantly. See docs/SINGLE_THREAD_DRIVER.md.
     /// </summary>
     public RunSimulator()
     {
-        SynchronizationContext.SetSynchronizationContext(_syncCtx);
+        _syncCtx.BindToCurrentThread();
+        _quiescence = new Quiescence(
+            _syncCtx,
+            () => _cardSelector.HasPending || _cardSelector.HasPendingReward ||
+                  (_pendingBundleTcs != null && !_pendingBundleTcs.Task.IsCompleted));
     }
 
     /// <summary>
@@ -223,12 +170,7 @@ public class RunSimulator
     /// </summary>
     private void DrainUntilComplete(Task task, int budgetMs = 2000)
     {
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (!task.IsCompleted && sw.ElapsedMilliseconds < budgetMs)
-        {
-            _syncCtx.Pump();
-            if (!task.IsCompleted) Thread.Sleep(1);
-        }
+        _quiescence.RunInline(task, budgetMs);
     }
 
     private static int? _expectedSaveSchemaVersion;
@@ -237,7 +179,8 @@ public class RunSimulator
 
     private RunState? _runState;
     private static bool _modelDbInitialized;
-    private static readonly InlineSynchronizationContext _syncCtx = new();
+    private readonly SingleThreadDispatcher _syncCtx = new();
+    private readonly Quiescence _quiescence;
     private readonly ManualResetEventSlim _turnStarted = new(false);
     private readonly ManualResetEventSlim _combatEnded = new(false);
     private static readonly LocLookup _loc = new();
@@ -251,10 +194,33 @@ public class RunSimulator
     private int _goldBeforeCombat;
     private int _lastKnownHp;
     private readonly HeadlessCardSelector _cardSelector = new();
+    // A small number of game APIs enter a synchronous ICardSelector method. They
+    // must bridge off the engine thread, but only one may be active and it must be
+    // joined after the external answer before another command mutates game state.
+    private Task? _pendingExternalTask;
     private IDisposable? _cardSelectorScope;
     // Pending bundle selection (Scroll Boxes: pick 1 of N packs)
     private IReadOnlyList<IReadOnlyList<CardModel>>? _pendingBundles;
     private TaskCompletionSource<IEnumerable<CardModel>>? _pendingBundleTcs;
+
+    private Task TrackExternalTask(Task task)
+    {
+        if (_pendingExternalTask is { IsCompleted: false })
+            throw new InvalidOperationException("an external-selection operation is already active");
+        _pendingExternalTask = task;
+        return task;
+    }
+
+    private void ResumeExternalTask()
+    {
+        var task = _pendingExternalTask;
+        if (task == null) return;
+        if (_cardSelector.HasPending || _cardSelector.HasPendingReward ||
+            (_pendingBundleTcs != null && !_pendingBundleTcs.Task.IsCompleted))
+            return;
+        if (_quiescence.RunInline(task, 5000))
+            _pendingExternalTask = null;
+    }
 
     public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null, string lang = "en")
     {
@@ -1362,9 +1328,10 @@ public class RunSimulator
             // pending selection appears so the caller can resolve it; the background task
             // continues once the selector's TCS is fed by select_cards.
             var inv = merchantRoom.GetLocalInventory();
-            // Runs inline on the engine thread; suspends on the selection TCS if the pickup
-            // opens a card_select, and resumes when select_cards feeds it. No thread pool.
-            var task = entry.OnTryPurchaseWrapper(inv);
+            // This API can enter the game's synchronous ICardSelector contract. Keep
+            // the blocking bridge off the engine dispatcher so the CLI can surface and
+            // resolve the external selection instead of self-deadlocking.
+            var task = TrackExternalTask(Task.Run(() => entry.OnTryPurchaseWrapper(inv)));
             for (int i = 0; i < 100; i++)
             {
                 _syncCtx.Pump();
@@ -1429,7 +1396,7 @@ public class RunSimulator
         try
         {
             // Run on background thread so card selection can pause (same pattern as event options)
-            var task = removal.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory());
+            var task = TrackExternalTask(Task.Run(() => removal.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory())));
             for (int i = 0; i < 100; i++)
             {
                 _syncCtx.Pump();
@@ -1648,7 +1615,7 @@ public class RunSimulator
             try
             {
                 // Run on background thread so Smith card selection can pause
-                var task = RunManager.Instance.RestSiteSynchronizer.ChooseLocalOption(optionIndex);
+                var task = TrackExternalTask(Task.Run(() => RunManager.Instance.RestSiteSynchronizer.ChooseLocalOption(optionIndex)));
                 for (int i = 0; i < 100; i++)
                 {
                     _syncCtx.Pump();
@@ -1701,7 +1668,7 @@ public class RunSimulator
                         _eventOptionChosen = true;
                         _lastEventOptionCount = options.Count;
                         // Run on thread pool so GetSelectedCards/GetSelectedCardReward can block
-                        var task = options[optionIndex].Chosen();
+                        var task = TrackExternalTask(Task.Run(() => options[optionIndex].Chosen()));
                         for (int i = 0; i < 100; i++)
                         {
                             _syncCtx.Pump();
@@ -2953,33 +2920,10 @@ public class RunSimulator
     {
         try
         {
-            // Ensure sync context is set for this thread
-            SynchronizationContext.SetSynchronizationContext(_syncCtx);
-
-            // Pump the synchronization context to execute any pending continuations
-            _syncCtx.Pump();
-
-            // Executor may stay "running" while the game awaits headless card selection / reward (e.g. Attack Potion).
-            // Spinning here would time out and downstream code could mis-handle an in-flight potion use (BUG-026).
-            if (_cardSelector.HasPending || _cardSelector.HasPendingReward)
-                return;
-
-            var executor = RunManager.Instance.ActionExecutor;
-            if (executor.IsRunning)
-            {
-                // Pump while the executor finishes, bounded by wall-clock time rather than an
-                // iteration count (a fixed 1000-iteration Thread.Sleep(1) spin was intended as
-                // a ~1s budget, but Windows rounds Sleep(1) up to ~15.6ms, making it ~15.6s).
-                // In headless this settles in milliseconds; the budget is only a backstop.
-                var deadline = System.Diagnostics.Stopwatch.StartNew();
-                while (deadline.ElapsedMilliseconds < 1000)
-                {
-                    _syncCtx.Pump();
-                    if (!executor.IsRunning) break;
-                    if (_cardSelector.HasPending || _cardSelector.HasPendingReward) break;
-                    Thread.Sleep(1);
-                }
-            }
+            _syncCtx.BindToCurrentThread();
+            _quiescence.DrainUntilQuiet();
+            ResumeExternalTask();
+            _quiescence.DrainUntilQuiet();
         }
         catch (Exception ex)
         {
@@ -3141,15 +3085,15 @@ public class RunSimulator
         return ctx;
     }
 
-    private static void EnsureModelDbInitialized()
+    private void EnsureModelDbInitialized()
     {
         if (_modelDbInitialized) return;
         _modelDbInitialized = true;
 
         TestMode.IsOn = true;
 
-        // Install inline sync context on main thread
-        SynchronizationContext.SetSynchronizationContext(_syncCtx);
+        // Initialization is engine-owned and must capture the FIFO dispatcher.
+        _syncCtx.BindToCurrentThread();
 
         // Initialize PlatformServices before anything touches PlatformUtil
         try
@@ -3468,7 +3412,7 @@ public class RunSimulator
             _rewardChoice = -1;
             _rewardWait = new ManualResetEventSlim(false);
 
-            Console.Error.WriteLine($"[SIM] Card reward pending: {options.Count} cards (blocking)");
+            Console.Error.WriteLine($"[SIM] Card reward pending: {options.Count} cards, alternatives=[{string.Join(',', alternatives.Select(a => a.GetType().Name))}] (blocking)");
             _rewardWait.Wait(TimeSpan.FromSeconds(300)); // Wait up to 5 min
 
             var choice = _rewardChoice;

@@ -8,9 +8,9 @@ namespace Sts2Headless;
 /// marshalled here and executed to completion before the next one starts, so the
 /// engine's async continuations always run on exactly one thread.
 ///
-/// P1 scaffold: this only serializes execution onto one thread; the RunSimulator
-/// internals still use the existing InlineSynchronizationContext / manual pump logic.
-/// Later phases replace those internals with a FIFO dispatcher + quiescence detection.
+/// RunSimulator installs a non-reentrant FIFO synchronization context and drives
+/// command boundaries by quiescence. Synchronous external-selection APIs use a
+/// tracked blocking bridge because their interface cannot suspend asynchronously.
 /// See docs/SINGLE_THREAD_DRIVER.md.
 /// </summary>
 internal sealed class EngineThread : IDisposable

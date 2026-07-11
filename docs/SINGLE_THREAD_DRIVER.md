@@ -1,6 +1,6 @@
 # Single-Thread FIFO Driver (Headless) — Design
 
-Status: **in progress** (see phase checklist). Owner branch: `rl-v2-protocol-state-machine`.
+Status: **P5 complete (2026-07-11)**. Owner branch: `rl-v2-protocol-state-machine`.
 Related: main repo `docs/RL_V2_CLI_STATE_MACHINE.md` (protocol state machine).
 
 ## Problem
@@ -44,8 +44,8 @@ the entire class of re-entrancy / ordering bugs.
 
 - **CLI thread** (existing `Main` loop): read line → deserialize → post a `Command` to the
   engine inbox → block on its completion → write JSON to stdout. Touches no game state.
-- **Engine thread** (new, single, dedicated): the *only* thread that touches `RunManager`
-  and the dispatcher. Loop:
+- **Engine thread** (new, single, dedicated): owns `RunManager` and the dispatcher.
+  Commands are serialized through its inbox.
 
   ```csharp
   while (running) {
@@ -78,8 +78,14 @@ Two mechanisms, both used:
 | Command main flow | Convert to real `async`/`await` so continuations return to the loop. |
 | Deep sync call sites | `RunInline(Task)` helper: drain the FIFO queue *while* waiting. **Never** call it from within a continuation — the single top-level drain point guarantees zero re-entrancy. |
 
-Discipline: an entire command executes as one async flow with **exactly one drain point**
-(the engine loop). No handler blocks mid-flight.
+The game also exposes a synchronous `ICardSelector.GetSelectedCardReward` contract. An
+event/rest/shop operation can enter that method before returning a `Task`, so running it
+directly on the engine thread self-deadlocks before the CLI can surface the selection.
+Those four call sites use one explicitly tracked blocking bridge task. Only one bridge may
+exist; after the CLI resolves its external selection, the engine thread joins it before
+accepting another state-mutating command. All captured engine continuations still use the
+FIFO dispatcher. Removing this final bridge requires a protocol-level suspended-work-item
+broker, not merely replacing `.GetResult()` with `await`.
 
 ### Card-selection round-trip
 
@@ -88,13 +94,15 @@ the selection TCS; that is a natural quiescent-with-input-needed point → retur
 `select_cards` sets the TCS; the loop resumes the continuation FIFO. Nested selection = two
 suspend/resume round-trips, each resumed in order.
 
-## What gets deleted (the #4 dividend)
+## What was deleted/replaced
 
-- `InlineSynchronizationContext` inline execution.
-- ~30 scattered `_syncCtx.Pump()` calls.
-- `WaitForActionExecutor`'s `IsRunning` spin (and the interim `_executorStuckLatched`).
-- 3 `Task.Run(...)` "nuclear" hacks (end-turn / shop) — they existed to escape the broken
-  pump; cross-thread state access is unsafe here and unnecessary once the loop is correct.
+- `InlineSynchronizationContext` inline execution was replaced by
+  `SingleThreadDispatcher`; `Post` now only enqueues.
+- `WaitForActionExecutor` no longer reads or spins on `ActionExecutor.IsRunning`; it drains
+  FIFO work to quiescence and joins a resolved blocking bridge.
+- The end-turn thread-pool fallback and stuck-executor latch were removed.
+- Four selector-capable event/rest/shop bridges remain for the synchronous selector API,
+  with explicit single-flight tracking and joining.
 
 ## New files
 
@@ -119,15 +127,9 @@ suspend/resume round-trips, each resumed in order.
       scheduling is now nondeterministic. **Half-measures don't work — thread-pool escapes
       must be removed to get true single-thread determinism.** Games still complete (race
       changes outcomes, not liveness), consistent with determinism being a P2+ gate.
-- [ ] **P1.5** *(inserted)* Build `SingleThreadDispatcher` (FIFO SynchronizationContext);
-      reroute the 3 `Task.Run` escapes onto the engine thread's own queue. Gate: P1.5
-      double-run bit-identical (race gone). This pulls the old P4 "delete `Task.Run`"
-      forward because it is load-bearing for determinism, not cleanup.
-- [x] **P1.5** Eliminated all 5 `Task.Run` thread-pool escapes. The sync context is pinned in
-      the RunSimulator ctor (constructed on the engine thread), so each op runs inline on the
-      engine thread — suspending on the selection TCS and resuming exactly as before, but
-      single-threaded. `DrainUntilComplete` replaces `Task.Wait`. Gate: **double-run
-      bit-identical (race gone)**, 5×5 25/25.
+- [x] **P1.5** Added `SingleThreadDispatcher`; `Post` is non-inline and FIFO. Removed the
+      end-turn escape. Testing exposed that four event/rest/shop APIs can synchronously enter
+      `GetSelectedCardReward`; these use the tracked single-flight bridge described above.
 - [x] **P3 — ROOT CAUSE FOUND AND CURED.** Not a timing/quiescence problem at all:
       `HeadlessCardSelector.ResolvePending` completed the selection TCS and *then* nulled
       `PendingOptions`/`_pendingTcs`. Completing the TCS runs the card's continuation
@@ -141,10 +143,13 @@ suspend/resume round-trips, each resumed in order.
       `DoSelectCards`). Gate: Necrobinder-32 / Regent-29 / Regent-74 went from a 2000-step
       frozen spin (~203s) to `game_over` in 60–65 steps (~1s). All 5 formerly-failing seeds
       pass with `error: null`.
-- [x] **P4** Deleted the interim `_executorStuckLatched` latch; `WaitForActionExecutor` is a
-      plain bounded pump again. Gate: 5×5 **25/25**, 5 seeds pass, double-run bit-identical.
-- [ ] **P5** Full 1000-run (`tools/m1_evaluate_1000.py`). Gate: 0 timeouts / 0 protocol errors /
-      0 non-terminating episodes. Only then bump the main-repo submodule pointer.
+- [x] **P4** Deleted the interim `_executorStuckLatched` latch and removed
+      `ActionExecutor.IsRunning` from command-completion detection. Gate: five reproducing
+      seeds and the 200-episode preflight pass.
+- [x] **P5** Full persistent-worker run (`tools/m1_evaluate_1000.py`): **1000/1000** reached
+      `game_over`, 0 timeouts, 0 protocol errors, 0 non-terminating episodes, 280.0 seconds
+      with 6 workers. Reset determinism matched across repeated, interleaved-character, and
+      separate-worker runs; no orphan engine processes remained.
 
 ## Note on the original diagnosis
 
