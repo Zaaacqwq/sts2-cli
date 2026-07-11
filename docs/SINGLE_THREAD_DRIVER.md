@@ -104,9 +104,25 @@ suspend/resume round-trips, each resumed in order.
 
 ## Phases (each validated with the 3 reproducing seeds)
 
-- [ ] **P0** Freeze baseline: 5×5 regression, deterministic state hash, 3-seed status.
-- [ ] **P1** Scaffold engine thread + FIFO dispatcher; commands serialized through it but
-      internals still use the old sync logic. Gate: 5×5 regression unchanged.
+- [x] **P0** Freeze baseline: 5×5 regression (25/25), deterministic argmin state-hash
+      anchor (`rl/schema/p0_baseline_hash.json`, double-run bit-identical), 3-seed status.
+      Finding: the engine is deterministic under a fixed action sequence; *stochastic*
+      rollouts are **not** process-stable because the engine emits candidate lists whose
+      order/length vary per process (.NET string-hash randomization) and `random.choice`
+      draws a length-dependent number of RNG bits. Anchor therefore uses a zero-RNG argmin.
+- [x] **P1** Scaffold engine thread (`EngineThread.cs`); every command marshalled onto one
+      dedicated thread. Gate: 5×5 regression **25/25 pass**.
+      **Finding (drives P1.5):** moving engine logic off the main thread exposed a *latent
+      race*. P0 double-run was bit-identical; P1 double-run diverges. Cause: the old
+      internals still use 3 `Task.Run(...)` escapes to the thread pool. On the main thread
+      the pump loop serialized them; on a dedicated engine thread the engine/pool
+      scheduling is now nondeterministic. **Half-measures don't work — thread-pool escapes
+      must be removed to get true single-thread determinism.** Games still complete (race
+      changes outcomes, not liveness), consistent with determinism being a P2+ gate.
+- [ ] **P1.5** *(inserted)* Build `SingleThreadDispatcher` (FIFO SynchronizationContext);
+      reroute the 3 `Task.Run` escapes onto the engine thread's own queue. Gate: P1.5
+      double-run bit-identical (race gone). This pulls the old P4 "delete `Task.Run`"
+      forward because it is load-bearing for determinism, not cleanup.
 - [ ] **P2** Migrate read paths (`start_run`/`map`/pure combat) to async; drop their `Pump`.
       Gate: same-seed state hash bit-identical to P0 (determinism preserved).
 - [ ] **P3** Migrate selection round-trip to the quiescence model; drop `IsRunning` reliance.

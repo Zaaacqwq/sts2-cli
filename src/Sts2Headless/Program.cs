@@ -72,7 +72,10 @@ class Program
             return null;
         };
 
-        var sim = new RunSimulator();
+        // All game-engine state lives on a single dedicated thread. Construct the
+        // simulator there too so no engine object is ever touched from two threads.
+        using var engine = new EngineThread();
+        var sim = engine.Invoke(() => new RunSimulator());
         WriteLine(new Dictionary<string, object?> { ["type"] = "ready", ["version"] = "0.2.0" });
 
         string? line;
@@ -85,7 +88,7 @@ class Program
             try
             {
                 var cmd = JsonSerializer.Deserialize<JsonElement>(line);
-                result = HandleCommand(sim, cmd);
+                result = engine.Invoke(() => HandleCommand(sim, cmd));
             }
             catch (JsonException ex)
             {
