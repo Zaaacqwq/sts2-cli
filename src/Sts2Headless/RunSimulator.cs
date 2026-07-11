@@ -244,14 +244,6 @@ public class RunSimulator
     private bool _eventOptionChosen;
     private int _lastEventOptionCount;
 
-    // Per-episode latch: once ActionExecutor.IsRunning is observed permanently
-    // stuck (a known engine bug after certain nested card selections resolve —
-    // Necrobinder Snap, Regent Begone), it stays true for the rest of the run.
-    // Waiting the full budget on every subsequent action wastes ~1s each and
-    // makes those episodes minutes long. We pay the full detection budget once,
-    // latch, then short-circuit later waits. Cleared on every episode reset.
-    private bool _executorStuckLatched;
-
     // Pending rewards for card selection (populated after combat, before proceeding)
     private List<Reward>? _pendingRewards;
     private CardReward? _pendingCardReward;
@@ -269,7 +261,6 @@ public class RunSimulator
         try
         {
             _loc.Lang = lang;
-            _executorStuckLatched = false;  // fresh episode — re-detect stuck executor from scratch
             // v0.107.1 lazily finishes ModManager while model types are first
             // inspected and throws once after completing that initialization.
             // Retrying the one-time initializer is safe and avoids making the
@@ -544,7 +535,6 @@ public class RunSimulator
         try
         {
             _loc.Lang = lang;
-            _executorStuckLatched = false;  // fresh episode — re-detect stuck executor from scratch
             EnsureModelDbInitialized();
 
             Log("Loading save file...");
@@ -2977,38 +2967,18 @@ public class RunSimulator
             var executor = RunManager.Instance.ActionExecutor;
             if (executor.IsRunning)
             {
-                // Pump while waiting for executor, bounded by wall-clock time rather than
-                // an iteration count. The loop used to spin a fixed 1000 iterations of
-                // Thread.Sleep(1), intending a ~1s budget — but Windows' default timer
-                // resolution rounds Sleep(1) up to ~15.6ms, so it actually spun for ~15.6s.
-                // DetectDecisionPoint() calls WaitForActionExecutor() a second time right
-                // after the action handler's own call, so a single stuck executor.IsRunning
-                // (observed permanently true for the rest of the episode once a second
-                // nested card selection — e.g. Necrobinder Snap, Regent Begone — resolves
-                // before the first one's effects finish committing) burned ~31s total per
-                // action and blew past the CLI client's 10s response timeout, even though
-                // the underlying game state was already valid and DetectDecisionPoint's own
-                // downstream serialization works fine once this loop gives up.
-                // Once we've already proven the executor is permanently stuck this
-                // episode, the game state is valid and it will never flip back to
-                // false — so don't burn the full budget again. Pump briefly (to flush
-                // any real pending continuation, which is ms-scale in headless) and
-                // move on. Full budget only on the first detection.
-                long budgetMs = _executorStuckLatched ? 50 : 1000;
+                // Pump while the executor finishes, bounded by wall-clock time rather than an
+                // iteration count (a fixed 1000-iteration Thread.Sleep(1) spin was intended as
+                // a ~1s budget, but Windows rounds Sleep(1) up to ~15.6ms, making it ~15.6s).
+                // In headless this settles in milliseconds; the budget is only a backstop.
                 var deadline = System.Diagnostics.Stopwatch.StartNew();
-                while (deadline.ElapsedMilliseconds < budgetMs)
+                while (deadline.ElapsedMilliseconds < 1000)
                 {
                     _syncCtx.Pump();
                     if (!executor.IsRunning) break;
                     if (_cardSelector.HasPending || _cardSelector.HasPendingReward) break;
                     Thread.Sleep(1);
                 }
-
-                // Budget expired with the executor still running and nothing pending:
-                // this is the permanent-stuck pattern. Latch so every later action in
-                // this episode short-circuits instead of paying the budget again.
-                if (executor.IsRunning && !_cardSelector.HasPending && !_cardSelector.HasPendingReward)
-                    _executorStuckLatched = true;
             }
         }
         catch (Exception ex)

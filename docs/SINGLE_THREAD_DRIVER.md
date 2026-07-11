@@ -123,13 +123,36 @@ suspend/resume round-trips, each resumed in order.
       reroute the 3 `Task.Run` escapes onto the engine thread's own queue. Gate: P1.5
       double-run bit-identical (race gone). This pulls the old P4 "delete `Task.Run`"
       forward because it is load-bearing for determinism, not cleanup.
-- [ ] **P2** Migrate read paths (`start_run`/`map`/pure combat) to async; drop their `Pump`.
-      Gate: same-seed state hash bit-identical to P0 (determinism preserved).
-- [ ] **P3** Migrate selection round-trip to the quiescence model; drop `IsRunning` reliance.
-      Gate: `Necrobinder-32`, `Regent-29`, `Regent-74` reach `game_over`, per-step < 50ms.
-- [ ] **P4** Delete `Task.Run` hacks, `WaitForActionExecutor`, latch. Gate: 5×5 + 3 seeds pass.
+- [x] **P1.5** Eliminated all 5 `Task.Run` thread-pool escapes. The sync context is pinned in
+      the RunSimulator ctor (constructed on the engine thread), so each op runs inline on the
+      engine thread — suspending on the selection TCS and resuming exactly as before, but
+      single-threaded. `DrainUntilComplete` replaces `Task.Wait`. Gate: **double-run
+      bit-identical (race gone)**, 5×5 25/25.
+- [x] **P3 — ROOT CAUSE FOUND AND CURED.** Not a timing/quiescence problem at all:
+      `HeadlessCardSelector.ResolvePending` completed the selection TCS and *then* nulled
+      `PendingOptions`/`_pendingTcs`. Completing the TCS runs the card's continuation
+      **inline** (the sync context executes posted continuations immediately), and for a
+      nested-select card (Necrobinder **Snap**, Regent **Begone**) that continuation re-enters
+      `GetSelectedCards` and registers a **second** selection — which the trailing nulls then
+      **wiped**. `HasPending` went false, so the CLI never surfaced the `card_select`, while the
+      engine awaited the orphaned TCS forever: `ActionExecutor.IsRunning` latched true and every
+      later combat action became a silent no-op — the frozen combat behind the "stuck seeds".
+      **Fix: clear the fields *before* completing the TCS** (+ surface a nested selection from
+      `DoSelectCards`). Gate: Necrobinder-32 / Regent-29 / Regent-74 went from a 2000-step
+      frozen spin (~203s) to `game_over` in 60–65 steps (~1s). All 5 formerly-failing seeds
+      pass with `error: null`.
+- [x] **P4** Deleted the interim `_executorStuckLatched` latch; `WaitForActionExecutor` is a
+      plain bounded pump again. Gate: 5×5 **25/25**, 5 seeds pass, double-run bit-identical.
 - [ ] **P5** Full 1000-run (`tools/m1_evaluate_1000.py`). Gate: 0 timeouts / 0 protocol errors /
       0 non-terminating episodes. Only then bump the main-repo submodule pointer.
+
+## Note on the original diagnosis
+
+The upstream notes attributed the wedge to a `Thread.Sleep(1)` timer-resolution issue making
+`WaitForActionExecutor` spin ~31s, and treated the stuck `ActionExecutor.IsRunning` as an
+un-root-caused engine bug ("止损 not 根治"). That was a symptom. The executor was stuck because
+it was legitimately awaiting a card selection that the selector had destroyed. Fixing the
+clear/complete ordering removes the wedge entirely — no latch, no cancel, no timeout tricks.
 
 ## Test matrix (run every phase)
 
