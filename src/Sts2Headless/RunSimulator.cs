@@ -1504,6 +1504,11 @@ public class RunSimulator
             return PendingCardSelectionState(player);
         WaitForActionExecutor();
 
+        // A nested selection registered by the continuation above (Snap / Begone) is now
+        // preserved by ResolvePending's clear-before-complete ordering; surface it.
+        if (_cardSelector.HasPending)
+            return PendingCardSelectionState(player);
+
         // Extra wait for rest-site SMITH: the background ChooseLocalOption task
         // needs time to complete the upgrade after card selection resolves.
         if (_runState?.CurrentRoom is RestSiteRoom)
@@ -3439,9 +3444,19 @@ public class RunSimulator
 
         public void ResolvePending(IEnumerable<CardModel> selected)
         {
-            _pendingTcs?.TrySetResult(selected);
+            // Clear BEFORE completing the TCS, never after. Completing it runs the card's
+            // continuation synchronously (the sync context executes posted continuations
+            // inline), and that continuation may register a NESTED selection — Necrobinder
+            // Snap and Regent Begone pick a card whose own effect opens a second prompt.
+            // Nulling the fields after TrySetResult wiped that brand-new nested selection:
+            // HasPending went false, so the CLI never surfaced the card_select, while the
+            // engine kept awaiting the now-orphaned TCS forever. ActionExecutor.IsRunning
+            // stayed true and every later combat action became a silent no-op — the frozen
+            // combat behind the "stuck seeds". See docs/SINGLE_THREAD_DRIVER.md (P3).
+            var tcs = _pendingTcs;
             PendingOptions = null;
             _pendingTcs = null;
+            tcs?.TrySetResult(selected);
         }
 
         public void ResolvePendingByIndices(int[] indices)
@@ -3456,9 +3471,11 @@ public class RunSimulator
 
         public void CancelPending()
         {
-            _pendingTcs?.TrySetResult(Array.Empty<CardModel>());
+            // Same clear-before-complete ordering as ResolvePending — see the note there.
+            var tcs = _pendingTcs;
             PendingOptions = null;
             _pendingTcs = null;
+            tcs?.TrySetResult(Array.Empty<CardModel>());
         }
 
         // Pending card reward from events (GetSelectedCardReward blocks until resolved)
