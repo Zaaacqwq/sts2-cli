@@ -369,10 +369,19 @@ public partial class RunSimulator
                 {
                     var id = cEl.GetString();
                     if (id == null) continue;
+                    // Trailing '+' per upgrade level ("BASH+" = upgraded Bash), so
+                    // curriculum loadouts can reproduce real mid-run decks.
+                    var upgrades = 0;
+                    while (id.EndsWith("+")) { upgrades++; id = id[..^1]; }
                     var canonical = ModelDb.GetById<CardModel>(new ModelId("CARD", id));
                     if (canonical == null)
                         return Error($"Unknown card: {id}");
                     var card = _runState.CreateCard(canonical, player);
+                    for (var u = 0; u < upgrades; u++)
+                    {
+                        card.UpgradeInternal();
+                        card.FinalizeUpgradeInternal();
+                    }
                     player.Deck.AddInternal(card, silent: true);
                 }
             }

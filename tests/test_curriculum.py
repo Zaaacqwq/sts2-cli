@@ -94,3 +94,24 @@ class TestListModels:
     def test_unknown_kind_fails_closed(self, game):
         result = game.send({"cmd": "list_models", "kind": "nonsense"})
         assert result["type"] == "error"
+
+
+class TestUpgradedDecks:
+    def test_plus_suffix_creates_upgraded_cards(self, game):
+        state = game.send({
+            "cmd": "start_combat", "character": "Ironclad", "seed": "upg-t1",
+            "ascension": 0, "encounter": "SLIMES_WEAK",
+            "player": {"deck": ["BASH+", "STRIKE_IRONCLAD"]},
+        })
+        assert state["decision"] == "combat_play"
+        deck = {(c["id"], c["upgraded"]) for c in state["player"]["deck"]}
+        assert ("CARD.BASH", True) in deck
+        assert ("CARD.STRIKE_IRONCLAD", False) in deck
+
+    def test_unknown_upgraded_card_fails_closed(self, game):
+        state = game.send({
+            "cmd": "start_combat", "character": "Ironclad", "seed": "upg-t2",
+            "ascension": 0, "encounter": "SLIMES_WEAK",
+            "player": {"deck": ["NOT_A_CARD+"]},
+        })
+        assert state["type"] == "error"
