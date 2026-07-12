@@ -226,6 +226,35 @@ class Program
                 return sim.SetDrawOrder(cards);
             }
 
+            case "start_combat":
+            {
+                var character = cmd.TryGetProperty("character", out var ch) ? ch.GetString() ?? "Ironclad" : "Ironclad";
+                var ascension = cmd.TryGetProperty("ascension", out var asc) ? asc.GetInt32() : 0;
+                var seed = cmd.TryGetProperty("seed", out var s) ? s.GetString() : null;
+                var language = cmd.TryGetProperty("lang", out var lang) ? lang.GetString() ?? "en" : "en";
+                var encounter = cmd.TryGetProperty("encounter", out var enc) ? enc.GetString() ?? "" : "";
+                if (string.IsNullOrEmpty(encounter))
+                    return new Dictionary<string, object?> { ["type"] = "error", ["message"] = "start_combat requires 'encounter'" };
+                var playerArgs = new Dictionary<string, JsonElement>();
+                if (cmd.TryGetProperty("player", out var playerElem))
+                    foreach (var prop in playerElem.EnumerateObject())
+                        playerArgs[prop.Name] = prop.Value;
+                List<string>? drawOrder = null;
+                if (cmd.TryGetProperty("draw_order", out var orderElem))
+                {
+                    drawOrder = new List<string>();
+                    foreach (var c in orderElem.EnumerateArray())
+                        drawOrder.Add(c.GetString() ?? "");
+                }
+                return sim.StartCombat(character, ascension, seed, language, playerArgs, encounter, drawOrder);
+            }
+
+            case "list_models":
+            {
+                var kind = cmd.TryGetProperty("kind", out var k) ? k.GetString() ?? "" : "";
+                return sim.ListModels(kind);
+            }
+
             case "write_continue_save":
             {
                 var outputPath = cmd.TryGetProperty("path", out var op) ? op.GetString() : null;

@@ -147,7 +147,7 @@ internal class LocLookup
 /// through map navigation, combat, events, rest sites, shops, and act transitions.
 /// Drives the engine forward until it hits a "decision point" requiring external input.
 /// </summary>
-public class RunSimulator
+public partial class RunSimulator
 {
     /// <summary>
     /// Constructed on the single engine thread (see EngineThread). Pin our sync context
@@ -342,17 +342,20 @@ public class RunSimulator
 
             if (args.TryGetValue("relics", out var relicsEl))
             {
-                var list = GetBackingList<RelicModel>(player, "_relics");
-                if (list != null)
+                // Go through Add/RemoveRelicInternal: they set Owner and wire the
+                // Flashed handlers. Bare backing-list writes leave ownerless relics
+                // that NullReference inside RunState.IterateHookListeners on the
+                // next combat.
+                foreach (var existing in player.Relics.ToList())
+                    player.RemoveRelicInternal(existing, silent: true);
+                foreach (var rEl in relicsEl.EnumerateArray())
                 {
-                    list.Clear();
-                    foreach (var rEl in relicsEl.EnumerateArray())
-                    {
-                        var id = rEl.GetString();
-                        if (id == null) continue;
-                        var model = ModelDb.GetById<RelicModel>(new ModelId("RELIC", id));
-                        if (model != null) list.Add(model.ToMutable());
-                    }
+                    var id = rEl.GetString();
+                    if (id == null) continue;
+                    var model = ModelDb.GetById<RelicModel>(new ModelId("RELIC", id));
+                    if (model == null)
+                        return Error($"Unknown relic: {id}");
+                    player.AddRelicInternal(model.ToMutable(), silent: true);
                 }
             }
             if (args.TryGetValue("deck", out var deckEl))
@@ -367,11 +370,10 @@ public class RunSimulator
                     var id = cEl.GetString();
                     if (id == null) continue;
                     var canonical = ModelDb.GetById<CardModel>(new ModelId("CARD", id));
-                    if (canonical != null)
-                    {
-                        var card = _runState.CreateCard(canonical, player);
-                        player.Deck.AddInternal(card, silent: true);
-                    }
+                    if (canonical == null)
+                        return Error($"Unknown card: {id}");
+                    var card = _runState.CreateCard(canonical, player);
+                    player.Deck.AddInternal(card, silent: true);
                 }
             }
             if (args.TryGetValue("potions", out var potionsEl))
@@ -389,15 +391,14 @@ public class RunSimulator
                         if (id != null)
                         {
                             var model = ModelDb.GetById<PotionModel>(new ModelId("POTION", id));
+                            if (model == null)
+                                return Error($"Unknown potion: {id}");
                             // Inject a mutable instance (not the canonical model — that throws
                             // CanonicalModelException when the game reads potion.Owner) and set its
                             // Owner, or UsePotionAction fails with "without an owner!".
-                            if (model != null)
-                            {
-                                var mutable = model.ToMutable();
-                                mutable.Owner = player;
-                                slots[idx] = mutable;
-                            }
+                            var mutable = model.ToMutable();
+                            mutable.Owner = player;
+                            slots[idx] = mutable;
                         }
                         idx++;
                     }
@@ -2289,6 +2290,7 @@ public class RunSimulator
                 // Enemy powers
                 var ePowers = e.Powers?.Select(pw => new Dictionary<string, object?>
                 {
+                    ["id"] = pw.Id.ToString(),
                     ["name"] = _loc.Power(pw.Id.Entry),
                     ["description"] = _loc.Bilingual("powers", pw.Id.Entry + ".description"),
                     ["amount"] = pw.Amount,
@@ -2297,6 +2299,7 @@ public class RunSimulator
                 return new Dictionary<string, object?>
                 {
                     ["index"] = i,
+                    ["id"] = e.Monster?.Id.ToString(),
                     ["name"] = _loc.Monster(e.Monster?.Id.Entry ?? "UNKNOWN"),
                     ["hp"] = e.CurrentHp,
                     ["max_hp"] = e.MaxHp,
@@ -2310,6 +2313,7 @@ public class RunSimulator
         // Player powers/buffs
         var playerPowers = player.Creature?.Powers?.Select(pw => new Dictionary<string, object?>
         {
+            ["id"] = pw.Id.ToString(),
             ["name"] = _loc.Power(pw.Id.Entry),
             ["description"] = _loc.Bilingual("powers", pw.Id.Entry + ".description"),
             ["amount"] = pw.Amount,
@@ -3019,6 +3023,7 @@ public class RunSimulator
                 try { foreach (var dv in r.DynamicVars.Values) vars[dv.Name] = (int)dv.BaseValue; } catch { }
                 return new Dictionary<string, object?>
                 {
+                    ["id"] = r.Id.ToString(),
                     ["name"] = _loc.Relic(r.Id.Entry),
                     ["description"] = _loc.Bilingual("relics", r.Id.Entry + ".description"),
                     ["vars"] = vars.Count > 0 ? vars : null,
@@ -3032,6 +3037,7 @@ public class RunSimulator
                 return new Dictionary<string, object?>
                 {
                     ["index"] = i,
+                    ["id"] = p.Id.ToString(),
                     ["name"] = _loc.Potion(p.Id.Entry),
                     ["description"] = _loc.Bilingual("potions", p.Id.Entry + ".description"),
                     ["vars"] = pvars.Count > 0 ? pvars : null,
@@ -3127,6 +3133,19 @@ public class RunSimulator
         {
             Console.Error.WriteLine($"[WARN] PlatformUtil init: {ex.Message}");
         }
+
+        // Headless never runs ModManager.Initialize (it is driven by the Godot
+        // startup flow), so ReflectionHelper.ModTypes gates like ModelDb.AllPowers
+        // would throw forever. State=Skipped is the engine's own "no mods" terminal
+        // state and GetLoadedMods() is empty, so reflection-marking it is faithful.
+        try
+        {
+            var modManager = typeof(MegaCrit.Sts2.Core.Modding.ModManager);
+            var state = modManager.GetProperty("State");
+            if (state != null && (int)(state.GetValue(null) ?? 0) == 0)
+                state.SetValue(null, Enum.Parse(state.PropertyType, "Skipped"));
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"[WARN] ModManager state init: {ex.Message}"); }
 
         // Initialize SaveManager with a dummy profile for save/load support
         try { SaveManager.Instance.InitProfileId(0); }
@@ -3437,6 +3456,19 @@ public class RunSimulator
             PendingOptions = null;
             _pendingTcs = null;
             tcs?.TrySetResult(Array.Empty<CardModel>());
+        }
+
+        public void AbandonAll()
+        {
+            // Run teardown only: drop pending state without completing the TCS,
+            // so no game continuation executes against the run being destroyed.
+            // (A blocking reward wait cannot be active here — it would mean the
+            // engine thread itself is parked and CleanUp could not be running.)
+            PendingOptions = null;
+            _pendingTcs = null;
+            PendingRewardCards = null;
+            _rewardWait = null;
+            _rewardChoice = -1;
         }
 
         // Pending card reward from events (GetSelectedCardReward blocks until resolved)
@@ -3973,6 +4005,21 @@ public class RunSimulator
     {
         try
         {
+            // An abandoned episode may still hold decision state (combat rewards
+            // waiting to be picked, an unresolved card/bundle selection). Nothing
+            // of it may survive into the next run: a stale _pendingRewards made
+            // the next start_combat open directly on the previous episode's
+            // card_reward, silently polluting training episodes. The selections
+            // are abandoned (not completed) so no game continuation runs against
+            // the run being torn down.
+            _pendingRewards = null;
+            _pendingCardReward = null;
+            _rewardsProcessed = false;
+            _pendingBundles = null;
+            _pendingBundleTcs = null;
+            _pendingExternalTask = null;
+            _cardSelector.AbandonAll();
+
             _cardSelectorScope?.Dispose();
             _cardSelectorScope = null;
             if (RunManager.Instance.IsInProgress)
