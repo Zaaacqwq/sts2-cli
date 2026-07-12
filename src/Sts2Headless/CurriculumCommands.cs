@@ -105,8 +105,12 @@ public partial class RunSimulator
                     rows.Add(new Dictionary<string, object?> { ["id"] = potion.Id.Entry });
                 break;
             case "event":
+                // Full ModelId form ("EVENT.X" / ancients' category) so vocab keys
+                // match the event_id states serialize.
                 foreach (var evt in ModelDb.AllEvents)
-                    rows.Add(new Dictionary<string, object?> { ["id"] = evt.Id.Entry });
+                    rows.Add(new Dictionary<string, object?> { ["id"] = evt.Id.ToString() });
+                foreach (var ancient in ModelDb.AllAncients)
+                    rows.Add(new Dictionary<string, object?> { ["id"] = ancient.Id.ToString() });
                 break;
             case "power":
                 foreach (var power in ModelDb.AllPowers)

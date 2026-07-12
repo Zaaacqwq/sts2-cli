@@ -2686,6 +2686,7 @@ public partial class RunSimulator
             ["type"] = "decision",
             ["decision"] = "event_choice",
             ["context"] = RunContext(),
+            ["event_id"] = localEvent.Id?.ToString() ?? eventEntry,
             ["event_name"] = eventName,
             ["description"] = eventDesc,
             ["options"] = options,
