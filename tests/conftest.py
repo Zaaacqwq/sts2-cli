@@ -4,6 +4,8 @@ import json
 import os
 import shutil
 import subprocess
+import threading
+from collections import deque
 import pytest
 
 DOTNET = os.path.expanduser("~/.dotnet-arm64/dotnet")
@@ -27,8 +29,19 @@ class Game:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1, env=env,
         )
+        # The simulator is intentionally verbose on stderr. Leaving the pipe
+        # unread eventually fills Windows' small OS buffer and blocks the child
+        # in Console.Error.WriteLine during longer combat tests. Drain it while
+        # retaining a bounded tail for diagnostics.
+        self.stderr_tail = deque(maxlen=200)
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
         ready = self._read()
         assert ready.get("type") == "ready", f"Expected ready, got: {ready}"
+
+    def _drain_stderr(self):
+        for line in self.proc.stderr:
+            self.stderr_tail.append(line.rstrip())
 
     def _read(self):
         while True:

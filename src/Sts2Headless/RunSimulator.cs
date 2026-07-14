@@ -1342,6 +1342,11 @@ public partial class RunSimulator
         var entry = entries[idx];
         if (!entry.IsStocked) return Error("Relic already purchased");
         if (player.Gold < entry.Cost) return Error("Not enough gold");
+        // Successful purchase may clear the inventory entry's Model reference.
+        // Capture diagnostics before invoking it; logging must never turn a
+        // successful transaction into a reported NullReference failure.
+        var relicName = entry.Model?.GetType().Name ?? "?";
+        var relicCost = entry.Cost;
 
         try
         {
@@ -1364,12 +1369,12 @@ public partial class RunSimulator
             }
             if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
             {
-                Log($"Buy relic {entry.Model.GetType().Name}: yielded for pending selection");
+                Log($"Buy relic {relicName}: yielded for pending selection");
                 return DetectDecisionPoint();
             }
             DrainUntilComplete(task);
             _syncCtx.Pump();
-            Log($"Bought relic: {entry.Model.GetType().Name} for {entry.Cost}g");
+            Log($"Bought relic: {relicName} for {relicCost}g");
         }
         catch (Exception ex) { return Error($"Buy relic failed: {ex.Message}"); }
 
@@ -1390,12 +1395,14 @@ public partial class RunSimulator
         var entry = entries[idx];
         if (!entry.IsStocked) return Error("Potion already purchased");
         if (player.Gold < entry.Cost) return Error("Not enough gold");
+        var potionName = entry.Model?.GetType().Name ?? "?";
+        var potionCost = entry.Cost;
 
         try
         {
             entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult();
             _syncCtx.Pump();
-            Log($"Bought potion: {entry.Model.GetType().Name} for {entry.Cost}g");
+            Log($"Bought potion: {potionName} for {potionCost}g");
         }
         catch (Exception ex)
         {
@@ -1833,6 +1840,7 @@ public partial class RunSimulator
                     var bkws = card.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToList();
                     return new Dictionary<string, object?>
                     {
+                        ["id"] = card.Id.ToString(),
                         ["name"] = _loc.Card(card.Id.Entry),
                         ["cost"] = card.EnergyCost?.GetResolved() ?? 0,
                         ["type"] = card.Type.ToString(),
@@ -2035,6 +2043,7 @@ public partial class RunSimulator
                 return Error("No map available");
         }
         var currentCoord = _runState!.CurrentMapCoord;
+        var fullMap = GetFullMap();
 
         List<Dictionary<string, object?>> choices;
         if (currentCoord.HasValue)
@@ -2109,6 +2118,15 @@ public partial class RunSimulator
             ["act"] = _runState.CurrentActIndex + 1,
             ["act_name"] = _loc.Act(_runState.Act?.Id.Entry ?? "OVERGROWTH"),
             ["floor"] = _runState.ActFloor,
+            // The graphical game shows the whole route. Returning only immediate
+            // children made route planning partially observable: the policy could
+            // not plan a rest before the boss or see what a branch leads to.
+            ["map"] = new Dictionary<string, object?>
+            {
+                ["rows"] = fullMap.GetValueOrDefault("rows"),
+                ["boss"] = fullMap.GetValueOrDefault("boss"),
+                ["current_coord"] = fullMap.GetValueOrDefault("current_coord"),
+            },
         };
     }
 
@@ -2235,11 +2253,13 @@ public partial class RunSimulator
             if (kws?.Count > 0) cardInfo["keywords"] = kws;
             if (c.Enchantment != null)
             {
+                cardInfo["enchantment_id"] = c.Enchantment.Id.ToString();
                 cardInfo["enchantment"] = _loc.Bilingual("enchantments", c.Enchantment.Id.Entry + ".title");
                 try { if (c.Enchantment.Amount != 0) cardInfo["enchantment_amount"] = c.Enchantment.Amount; } catch { }
             }
             if (c.Affliction != null)
             {
+                cardInfo["affliction_id"] = c.Affliction.Id.ToString();
                 cardInfo["affliction"] = _loc.Bilingual("afflictions", c.Affliction.Id.Entry + ".title");
                 try { if (c.Affliction.Amount != 0) cardInfo["affliction_amount"] = c.Affliction.Amount; } catch { }
             }
@@ -2354,6 +2374,7 @@ public partial class RunSimulator
                 result["orbs"] = orbQueue.Orbs.Select((orb, i) => new Dictionary<string, object?>
                 {
                     ["index"] = i,
+                    ["id"] = orb.Id.ToString(),
                     ["name"] = _loc.Bilingual("orbs", orb.Id.Entry + ".title"),
                     ["type"] = orb.GetType().Name.Replace("Orb", ""),
                     ["passive"] = (int)orb.PassiveVal,
@@ -2659,7 +2680,12 @@ public partial class RunSimulator
                     {
                         var deck = _runState?.Players?[0]?.Deck?.Cards;
                         if (deck != null && rcIdx >= 0 && rcIdx < deck.Count && deck[rcIdx] != null)
+                        {
+                            // Keep a locale-independent identity for agents. RandomCard remains
+                            // the rendered name for existing UI clients.
+                            optVars["RandomCardId"] = deck[rcIdx].Id.ToString();
                             optVars["RandomCard"] = _loc.Card(deck[rcIdx].Id.Entry);
+                        }
                     }
                     catch { }
                 }
@@ -2769,6 +2795,7 @@ public partial class RunSimulator
                 return new Dictionary<string, object?>
                 {
                     ["index"] = i,
+                    ["id"] = card?.Id.ToString(),
                     ["name"] = _loc.Card(entry),
                     ["type"] = card?.Type.ToString() ?? "?",
                     ["rarity"] = card?.Rarity.ToString() ?? "?",
@@ -2779,6 +2806,7 @@ public partial class RunSimulator
                     ["after_upgrade"] = card != null ? GetUpgradedInfo(card) : null,
                     ["cost"] = e.Cost,
                     ["is_stocked"] = e.IsStocked,
+                    ["affordable"] = e.IsStocked && player.Gold >= e.Cost,
                     ["on_sale"] = e.IsOnSale,
                 };
             }).ToList();
@@ -2786,19 +2814,23 @@ public partial class RunSimulator
         var relics = inv.RelicEntries.Select((e, i) => new Dictionary<string, object?>
         {
             ["index"] = i,
+            ["id"] = e.Model?.Id.ToString(),
             ["name"] = _loc.Relic(e.Model?.Id.Entry ?? "?"),
             ["description"] = _loc.Bilingual("relics", (e.Model?.Id.Entry ?? "?") + ".description"),
             ["cost"] = e.Cost,
             ["is_stocked"] = e.IsStocked,
+            ["affordable"] = e.IsStocked && player.Gold >= e.Cost,
         }).ToList();
 
         var potions = inv.PotionEntries.Select((e, i) => new Dictionary<string, object?>
         {
             ["index"] = i,
+            ["id"] = e.Model?.Id.ToString(),
             ["name"] = _loc.Potion(e.Model?.Id.Entry ?? "?"),
             ["description"] = _loc.Bilingual("potions", (e.Model?.Id.Entry ?? "?") + ".description"),
             ["cost"] = e.Cost,
             ["is_stocked"] = e.IsStocked,
+            ["affordable"] = e.IsStocked && player.Gold >= e.Cost,
         }).ToList();
 
         var removal = merchantRoom.GetLocalInventory().CardRemovalEntry;
@@ -2812,6 +2844,7 @@ public partial class RunSimulator
             ["relics"] = relics,
             ["potions"] = potions,
             ["card_removal_cost"] = removal?.Cost,
+            ["can_remove_card"] = removal?.IsStocked == true && player.Gold >= removal.Cost,
             ["player"] = PlayerSummary(player),
         };
     }
@@ -3076,11 +3109,13 @@ public partial class RunSimulator
                 // can see e.g. Slither applied to a deck card after an event (#76).
                 if (c.Enchantment != null)
                 {
+                    dcard["enchantment_id"] = c.Enchantment.Id.ToString();
                     dcard["enchantment"] = _loc.Bilingual("enchantments", c.Enchantment.Id.Entry + ".title");
                     try { if (c.Enchantment.Amount != 0) dcard["enchantment_amount"] = c.Enchantment.Amount; } catch { }
                 }
                 if (c.Affliction != null)
                 {
+                    dcard["affliction_id"] = c.Affliction.Id.ToString();
                     dcard["affliction"] = _loc.Bilingual("afflictions", c.Affliction.Id.Entry + ".title");
                     try { if (c.Affliction.Amount != 0) dcard["affliction_amount"] = c.Affliction.Amount; } catch { }
                 }

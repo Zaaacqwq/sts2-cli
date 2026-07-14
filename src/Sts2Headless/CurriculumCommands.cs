@@ -1,3 +1,5 @@
+using System.Collections;
+using System.Reflection;
 using System.Text.Json;
 using MegaCrit.Sts2.Core.Models;
 
@@ -85,12 +87,21 @@ public partial class RunSimulator
                 break;
             case "card":
                 foreach (var card in ModelDb.AllCards)
-                    rows.Add(new Dictionary<string, object?>
+                {
+                    var row = new Dictionary<string, object?>
                     {
                         ["id"] = card.Id.Entry,
                         ["type"] = card.Type.ToString(),
                         ["rarity"] = card.Rarity.ToString(),
-                    });
+                    };
+                    try
+                    {
+                        row["dynamic_vars"] = card.ToMutable().DynamicVars.Values
+                            .Select(value => value.Name.ToLowerInvariant()).Distinct().ToList();
+                    }
+                    catch { }
+                    rows.Add(row);
+                }
                 break;
             case "relic":
                 foreach (var relic in ModelDb.AllRelics)
@@ -116,12 +127,21 @@ public partial class RunSimulator
                 foreach (var power in ModelDb.AllPowers)
                     rows.Add(new Dictionary<string, object?> { ["id"] = power.Id.Entry });
                 break;
+            case "orb":
+                AddReflectedModels(rows, "orb");
+                break;
+            case "enchantment":
+                AddReflectedModels(rows, "enchant");
+                break;
+            case "affliction":
+                AddReflectedModels(rows, "affliction");
+                break;
             case "character":
                 foreach (var ch in ModelDb.AllCharacters)
                     rows.Add(new Dictionary<string, object?> { ["id"] = ch.Id.Entry });
                 break;
             default:
-                return Error($"Unknown model kind: {kind} (expected encounter/card/monster/relic/potion/event/power/character)");
+                return Error($"Unknown model kind: {kind} (expected encounter/card/monster/relic/potion/event/power/orb/enchantment/affliction/character)");
         }
         return new Dictionary<string, object?>
         {
@@ -129,6 +149,33 @@ public partial class RunSimulator
             ["kind"] = kind,
             ["models"] = rows,
         };
+    }
+
+    /// <summary>
+    /// Enumerate less frequently used ModelDb catalogs without taking a compile-time
+    /// dependency on their generated property names. The game has renamed these
+    /// collections across builds; their values still expose the stable ModelId.
+    /// </summary>
+    private static void AddReflectedModels(
+        List<Dictionary<string, object?>> rows, string propertyNameFragment)
+    {
+        var seen = new HashSet<string>();
+        var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
+        foreach (var property in typeof(ModelDb).GetProperties(flags))
+        {
+            if (!property.Name.Contains(propertyNameFragment, StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (property.GetValue(null) is not IEnumerable values)
+                continue;
+            foreach (var model in values)
+            {
+                if (model == null) continue;
+                var id = model.GetType().GetProperty("Id", flags | BindingFlags.Instance)?.GetValue(model);
+                var entry = id?.GetType().GetProperty("Entry", flags | BindingFlags.Instance)?.GetValue(id)?.ToString();
+                if (!string.IsNullOrWhiteSpace(entry) && seen.Add(entry))
+                    rows.Add(new Dictionary<string, object?> { ["id"] = entry });
+            }
+        }
     }
 
     private static void AddEncounters(

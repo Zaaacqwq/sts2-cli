@@ -12,6 +12,7 @@ class TestShopStructure:
         assert "relics" in state
         assert "potions" in state
         assert "card_removal_cost" in state
+        assert "can_remove_card" in state
 
     def test_shop_cards_have_description(self, game):
         state = game.start(seed="ss2")
@@ -23,6 +24,8 @@ class TestShopStructure:
             assert "cost" in card
             assert "type" in card
             assert "card_cost" in card
+            assert card.get("id")
+            assert card["affordable"] == (card["is_stocked"] and state["player"]["gold"] >= card["cost"])
 
     def test_shop_cards_have_upgrade_preview(self, game):
         state = game.start(seed="ss3")
@@ -38,6 +41,8 @@ class TestShopStructure:
         for r in state["relics"]:
             assert isinstance(r["name"], str)
             assert "description" in r
+            assert r.get("id")
+            assert "affordable" in r
 
     def test_shop_potions_have_description(self, game):
         state = game.start(seed="ss5")
@@ -46,6 +51,8 @@ class TestShopStructure:
         for p in state["potions"]:
             assert isinstance(p["name"], str)
             assert "description" in p
+            assert p.get("id")
+            assert "affordable" in p
 
 
 class TestShopBuy:
@@ -73,6 +80,24 @@ class TestShopBuy:
         if stocked:
             state = game.act("buy_card", card_index=stocked[0]["index"])
             assert state.get("type") == "error"
+
+    def test_buy_relic_does_not_fail_after_inventory_entry_is_consumed(self, game):
+        state = game.start(seed="sb-relic")
+        game.skip_neow(state)
+        game.set_player(gold=999)
+        state = game.enter_room("shop")
+        relic = next(r for r in state["relics"] if r["is_stocked"])
+        state = game.act("buy_relic", relic_index=relic["index"])
+        assert state.get("type") != "error", state
+
+    def test_buy_potion_does_not_fail_after_inventory_entry_is_consumed(self, game):
+        state = game.start(seed="sb-potion")
+        game.skip_neow(state)
+        game.set_player(gold=999)
+        state = game.enter_room("shop")
+        potion = next(p for p in state["potions"] if p["is_stocked"])
+        state = game.act("buy_potion", potion_index=potion["index"])
+        assert state.get("type") != "error", state
 
     def test_leave_shop(self, game):
         state = game.start(seed="sb3")
