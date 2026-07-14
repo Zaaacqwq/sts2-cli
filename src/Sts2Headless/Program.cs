@@ -39,8 +39,28 @@ class Program
         return Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "lib"));
     }
 
+    /// <summary>
+    /// Windows wakes sleeping threads only on its scheduler tick, which defaults to
+    /// 64Hz — so <c>Sleep(5)</c>, <c>Sleep(10)</c> and <c>WaitHandle.WaitOne(1)</c>
+    /// all really take 15.625ms. The dispatcher polls with <c>RunOne(1)</c> and
+    /// <c>WaitForActionExecutor</c> drains twice per action, so two of those rounded
+    /// waits land on the critical path of every single decision: measured at 58ms per
+    /// engine round-trip, against ~2ms of actual work.
+    ///
+    /// timeBeginPeriod(1) raises the tick to 1kHz for this process. Since Windows 10
+    /// 2004 the request is per-process, so the host asking for it does not help us —
+    /// the engine has to ask for itself.
+    /// </summary>
+    [System.Runtime.InteropServices.DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
+    private static extern uint TimeBeginPeriod(uint period);
+
     static void Main(string[] args)
     {
+        if (OperatingSystem.IsWindows())
+        {
+            try { TimeBeginPeriod(1); } catch { /* precision is an optimisation, not a requirement */ }
+        }
+
         // Prevent unhandled exceptions from crashing the process
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
         {
