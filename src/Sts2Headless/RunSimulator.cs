@@ -517,6 +517,44 @@ public partial class RunSimulator
         catch (Exception ex) { return ErrorWithTrace("SetDrawOrder failed", ex); }
     }
 
+    /// <summary>
+    /// Read-only export of the ordered combat piles (hand / draw / discard), for
+    /// differential testing against a fast simulator. ``draw_pile`` is top-first
+    /// (index 0 is the next card drawn), matching SetDrawOrder's ordering. This
+    /// mutates nothing, so gameplay and state hashes are unchanged: it lets the
+    /// diff harness read the real engine's actual card order — including the
+    /// opening hand, which ``draw_order`` cannot control because it is applied
+    /// only after EnterRoom has already dealt the opening hand — and mirror it in
+    /// the simulator to neutralize draw RNG on every step.
+    /// </summary>
+    public Dictionary<string, object?> GetDrawPile()
+    {
+        try
+        {
+            if (_runState == null) return Error("No run in progress");
+            var pcs = _runState.Players[0].PlayerCombatState;
+            if (pcs?.DrawPile == null) return Error("Not in combat");
+
+            static List<Dictionary<string, object?>> Serialize(IEnumerable<CardModel>? cards) =>
+                (cards ?? Enumerable.Empty<CardModel>())
+                    .Select((c, i) => new Dictionary<string, object?>
+                    {
+                        ["index"] = i,
+                        ["id"] = c.Id.Entry,
+                        ["upgraded"] = c.IsUpgraded,
+                    }).ToList();
+
+            return new Dictionary<string, object?>
+            {
+                ["type"] = "ok",
+                ["hand"] = Serialize(pcs.Hand?.Cards),
+                ["draw_pile"] = Serialize(pcs.DrawPile?.Cards),
+                ["discard_pile"] = Serialize(pcs.DiscardPile?.Cards),
+            };
+        }
+        catch (Exception ex) { return ErrorWithTrace("GetDrawPile failed", ex); }
+    }
+
     // ─── Game actions ───
     public Dictionary<string, object?> LoadSave(string saveJson, string lang = "en")
     {

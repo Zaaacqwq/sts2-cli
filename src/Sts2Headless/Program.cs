@@ -246,6 +246,9 @@ class Program
                 return sim.SetDrawOrder(cards);
             }
 
+            case "get_draw_pile":
+                return sim.GetDrawPile();
+
             case "start_combat":
             {
                 var character = cmd.TryGetProperty("character", out var ch) ? ch.GetString() ?? "Ironclad" : "Ironclad";
