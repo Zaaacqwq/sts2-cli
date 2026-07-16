@@ -2585,6 +2585,12 @@ public partial class RunSimulator
         }
     }
 
+    // Events whose resolution runs Godot UI/minigame code that NullRefs in headless.
+    // Keyed by the game event class name (localEvent.GetType().Name). Skipped to the
+    // map on entry so they don't poison the engine during full-run/act2+ play.
+    private static readonly HashSet<string> HeadlessUnsupportedEvents =
+        new(StringComparer.Ordinal) { "Amalgamator", "CrystalSphere" };
+
     private Dictionary<string, object?> EventChoiceState(EventRoom eventRoom)
     {
         var localEvent = RunManager.Instance.EventSynchronizer?.GetLocalEvent();
@@ -2613,6 +2619,21 @@ public partial class RunSimulator
                 catch { }
             }
             return _runState?.CurrentRoom is MapRoom ? MapSelectState() : DetectDecisionPoint();
+        }
+
+        // A few late-act events run Godot UI code that NullRefs in the headless
+        // (no scene tree) environment: Amalgamator.CombineStrikes() dereferences a
+        // missing VFX/UI object, and the CrystalSphere event tries to open an
+        // interactive minigame *screen* (NCrystalSphereScreen.ShowScreen). Both
+        // crash the engine when their option/continuation runs — surfaced by
+        // full-run RL eval. The agent can't play a minigame anyway, so skip these
+        // events to the map on entry rather than poisoning the engine.
+        if (HeadlessUnsupportedEvents.Contains(localEvent.GetType().Name))
+        {
+            Log($"Event {localEvent.GetType().Name} needs Godot UI; auto-skipping in headless");
+            try { RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult(); _syncCtx.Pump(); }
+            catch { }
+            return MapSelectState();
         }
 
         var currentOptions = localEvent.CurrentOptions;

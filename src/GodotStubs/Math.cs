@@ -49,6 +49,9 @@ public struct Vector2I
     public int Y;
     public Vector2I(int x, int y) { X = x; Y = y; }
     public static Vector2I Zero { get; } = new(0, 0);
+    // Act 2/3 content reads Vector2I.One (missing overload throws MissingMethodException
+    // in headless — surfaced by full-run RL eval crashing on later-act rooms).
+    public static Vector2I One { get; } = new(1, 1);
     public static implicit operator Vector2(Vector2I v) => new(v.X, v.Y);
 }
 

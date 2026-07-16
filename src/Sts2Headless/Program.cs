@@ -140,6 +140,9 @@ class Program
                     ["fatal"] = true,
                     ["code"] = ex.Code,
                     ["message"] = ex.Message,
+                    // Surface the underlying stack so background-task faults (Quiescence
+                    // engine_task_fault) are locatable from the client, not just stderr.
+                    ["stack_trace"] = (ex.InnerException ?? ex).StackTrace,
                 };
             }
             catch (Exception ex)
