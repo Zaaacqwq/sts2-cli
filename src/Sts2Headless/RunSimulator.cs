@@ -320,6 +320,21 @@ public partial class RunSimulator
         return field?.GetValue(obj) as List<T>;
     }
 
+    // The potion belt is a fixed-size slot list with null for empty slots. Full = no
+    // null slots. Used to stop the shop offering buy_potion when the belt is full,
+    // which otherwise fails inside the engine, gets swallowed, and returns an
+    // identical state (a no-op the agent can loop on). Fail-open: unknown layout
+    // must not block legitimate purchases.
+    private static bool IsPotionBeltFull(Player player)
+    {
+        var slots = GetBackingList<PotionModel>(player, "_potionSlots") as System.Collections.IList
+                 ?? GetBackingList<PotionModel?>(player, "_potionSlots") as System.Collections.IList;
+        if (slots == null || slots.Count == 0) return false;
+        for (int i = 0; i < slots.Count; i++)
+            if (slots[i] == null) return false;
+        return true;
+    }
+
     private static void SetField(object obj, string fieldName, object? value)
     {
         var field = obj.GetType().GetField(fieldName, NonPublic);
@@ -2881,6 +2896,7 @@ public partial class RunSimulator
             ["affordable"] = e.IsStocked && player.Gold >= e.Cost,
         }).ToList();
 
+        var potionBeltFull = IsPotionBeltFull(player);
         var potions = inv.PotionEntries.Select((e, i) => new Dictionary<string, object?>
         {
             ["index"] = i,
@@ -2889,7 +2905,8 @@ public partial class RunSimulator
             ["description"] = _loc.Bilingual("potions", (e.Model?.Id.Entry ?? "?") + ".description"),
             ["cost"] = e.Cost,
             ["is_stocked"] = e.IsStocked,
-            ["affordable"] = e.IsStocked && player.Gold >= e.Cost,
+            // A full belt means the buy would no-op inside the engine — don't offer it.
+            ["affordable"] = e.IsStocked && player.Gold >= e.Cost && !potionBeltFull,
         }).ToList();
 
         var removal = merchantRoom.GetLocalInventory().CardRemovalEntry;
