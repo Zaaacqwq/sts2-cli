@@ -157,6 +157,7 @@ public partial class RunSimulator
     public RunSimulator()
     {
         _syncCtx.BindToCurrentThread();
+        _cardSelector.IsForcedNow = () => _inEnemyTurn;
         _quiescence = new Quiescence(
             _syncCtx,
             () => _cardSelector.HasPending || _cardSelector.HasPendingReward ||
@@ -194,6 +195,10 @@ public partial class RunSimulator
     private int _goldBeforeCombat;
     private int _lastKnownHp;
     private readonly HeadlessCardSelector _cardSelector = new();
+    // True only while an enemy turn is being processed, so the selector can latch whether a
+    // prompt it registers was forced on the player by an enemy move (Knowledge Demon's
+    // CURSE_OF_KNOWLEDGE) rather than opened by the player themselves.
+    private volatile bool _inEnemyTurn;
     // A small number of game APIs enter a synchronous ICardSelector method. They
     // must bridge off the engine thread, but only one may be active and it must be
     // joined after the external answer before another command mutates game state.
@@ -1151,6 +1156,16 @@ public partial class RunSimulator
         // Ensure no actions are still running before ending turn
         WaitForActionExecutor();
 
+        // Everything below is enemy-turn processing, so any prompt the selector registers in that
+        // window was forced on the player by an enemy move. The flag MUST be cleared on every exit
+        // — leaking it true would mark the next player-opened selection mandatory too.
+        _inEnemyTurn = true;
+        try { return ProcessEnemyTurn(player); }
+        finally { _inEnemyTurn = false; }
+    }
+
+    private Dictionary<string, object?> ProcessEnemyTurn(Player player)
+    {
         Log($"Ending turn (round={CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0})");
         _turnStarted.Reset();
         _combatEnded.Reset();
@@ -1600,9 +1615,12 @@ public partial class RunSimulator
     {
         if (_cardSelector.HasPending)
         {
-            // Mirror the reported min_select: an enemy-forced choice is not skippable.
-            if (EffectiveMinSelect((_cardSelector.PendingOptions ?? new List<CardModel>()).Count) >= 1)
-                return Error("This selection is mandatory (min_select >= 1); use select_cards");
+            // Only an enemy-forced choice is unskippable. A player-opened selection may carry a
+            // large mandatory minimum of its own (Pael's Tooth: pick 5 of 22) that the RL adapter
+            // cannot enumerate — it deliberately degrades to skip_select rather than fail the
+            // episode, so rejecting every min>=1 here killed ~10% of runs at that event.
+            if (_cardSelector.PendingIsForced)
+                return Error("This selection was forced by an enemy move and cannot be skipped; use select_cards");
             Log("Skipping card selection");
             _cardSelector.CancelPending();
             _syncCtx.Pump();
@@ -3078,18 +3096,16 @@ public partial class RunSimulator
     }
 
     /// <summary>
-    /// A selection opened while combat is running and the player is NOT in the Play phase was
-    /// forced on the player by an enemy move — Knowledge Demon's CURSE_OF_KNOWLEDGE makes you take
-    /// one of two debuffs. The game passes minSelect=0 for these (its own UI is what makes the
-    /// choice mandatory: the screen cannot be dismissed), so reporting 0 verbatim let a headless
-    /// caller `skip_select` and decline the curse outright — taking zero Disintegration. Anything
-    /// the player opens themselves happens in the Play phase (Armaments, Headbutt) or out of combat
-    /// (shop, rest, event) and keeps the engine's own minimum.
+    /// A prompt an enemy move forced on the player — Knowledge Demon's CURSE_OF_KNOWLEDGE makes
+    /// you take one of two debuffs — is not skippable. The game passes minSelect=0 for it (its own
+    /// UI is what makes the choice mandatory: the screen cannot be dismissed), so reporting 0
+    /// verbatim let a headless caller `skip_select` and decline the curse outright, taking zero
+    /// Disintegration. Everything the player opens themselves keeps the engine's own minimum.
     /// </summary>
     private int EffectiveMinSelect(int optionCount)
     {
         var raw = _cardSelector.PendingMinSelect;
-        if (optionCount > 0 && CombatManager.Instance.IsInProgress && !IsPlayPhase())
+        if (optionCount > 0 && _cardSelector.PendingIsForced)
             return Math.Max(raw, 1);
         return raw;
     }
@@ -3623,6 +3639,12 @@ public partial class RunSimulator
         public string PendingPrompt { get; private set; } = "";
         private TaskCompletionSource<IEnumerable<CardModel>>? _pendingTcs;
 
+        /// <summary>Set by the owner; answers "is an enemy turn being processed right now?".</summary>
+        public Func<bool>? IsForcedNow { get; set; }
+
+        /// <summary>Whether the pending prompt was forced on the player by an enemy move.</summary>
+        public bool PendingIsForced { get; private set; }
+
         public bool HasPending => _pendingTcs != null && !_pendingTcs.Task.IsCompleted;
 
         public Task<IEnumerable<CardModel>> GetSelectedCards(
@@ -3640,6 +3662,12 @@ public partial class RunSimulator
             PendingOptions = optList;
             PendingMinSelect = minSelect;
             PendingMaxSelect = maxSelect;
+            // Latch *at registration* whether an enemy move forced this prompt. Deciding it later
+            // from global state does not work: CombatManager.IsInProgress stays true after a fight
+            // ends and PlayerCombatState.Phase is not Play outside combat, so a player-opened
+            // event selection (Pael) was indistinguishable from an enemy-forced one and got
+            // wrongly marked mandatory — killing ~10% of episodes with a ProtocolError.
+            PendingIsForced = IsForcedNow?.Invoke() ?? false;
             _pendingTcs = new TaskCompletionSource<IEnumerable<CardModel>>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             Console.Error.WriteLine($"[SIM] Card selection pending: {optList.Count} options, select {minSelect}-{maxSelect}");
