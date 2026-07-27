@@ -3296,6 +3296,12 @@ public partial class RunSimulator
         // moves (e.g. BygoneEffigy.WakeMove) NRE in headless and break the enemy turn.
         PatchTalkCmd();
 
+        // Kaiser Crab (Crusher) boss: its Background getter throws in headless (no
+        // NCombatRoom/NBestiary visual node), so AfterAddedToRoom threw before the
+        // monster finished spawning — the boss came up with 0 enemies and was an
+        // instant free win. Return a dummy background and no-op its anim methods.
+        PatchKaiserCrab();
+
         // Audio, waits and one event rumble are presentation-only. Patch their exact
         // call surfaces without making the global NGame singleton non-null.
         HeadlessPresentation.Install();
@@ -3465,6 +3471,62 @@ public partial class RunSimulator
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[WARN] Failed to patch TalkCmd.Play: {ex.Message}");
+        }
+    }
+
+    private static void PatchKaiserCrab()
+    {
+        try
+        {
+            var harmony = new Harmony("sts2headless.kaisercrab");
+            var asm = typeof(CombatManager).Assembly;
+            var crusherType = asm.GetType("MegaCrit.Sts2.Core.Models.Monsters.Crusher");
+            var bgType = asm.GetType("MegaCrit.Sts2.Core.Nodes.Vfx.Backgrounds.NKaiserCrabBossBackground");
+            if (crusherType == null || bgType == null)
+            {
+                Console.Error.WriteLine("[WARN] Could not find Crusher/NKaiserCrabBossBackground to patch");
+                return;
+            }
+            const System.Reflection.BindingFlags flags =
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic;
+            var statics = System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public;
+
+            // 1) Every monster in the Kaiser Crab fight (Crusher = body/left arm,
+            //    Rocket = right arm) has the same `NKaiserCrabBossBackground Background`
+            //    getter that throws in headless. Patch the getter on every monster type
+            //    whose Background property is that type, so none is missed.
+            var bgPrefix = typeof(KaiserCrabPatches).GetMethod(nameof(KaiserCrabPatches.BackgroundPrefix), statics);
+            Type?[] monsterTypes;
+            try { monsterTypes = asm.GetTypes(); }
+            catch (System.Reflection.ReflectionTypeLoadException ex) { monsterTypes = ex.Types; }
+            foreach (var t in monsterTypes)
+            {
+                if (t == null) continue;
+                var prop = t.GetProperty("Background", flags);
+                if (prop?.PropertyType != bgType) continue;
+                var getBg = prop.GetGetMethod(nonPublic: true);
+                if (getBg != null && bgPrefix != null)
+                    harmony.Patch(getBg, new HarmonyMethod(bgPrefix));
+            }
+
+            // 2) The dummy's animation methods deref a null _animController in headless;
+            //    no-op every Play* method (void → skip, Task → completed). Only the crab uses them.
+            var skipVoid = typeof(KaiserCrabPatches).GetMethod(nameof(KaiserCrabPatches.SkipVoid), statics);
+            var skipTask = typeof(KaiserCrabPatches).GetMethod(nameof(KaiserCrabPatches.SkipTask), statics);
+            foreach (var m in bgType.GetMethods(System.Reflection.BindingFlags.Instance |
+                                                System.Reflection.BindingFlags.Public))
+            {
+                if (!m.Name.StartsWith("Play")) continue;
+                var prefix = m.ReturnType == typeof(Task) ? skipTask
+                           : m.ReturnType == typeof(void) ? skipVoid : null;
+                if (prefix != null) harmony.Patch(m, new HarmonyMethod(prefix));
+            }
+            Console.Error.WriteLine("[INFO] Patched Kaiser Crab (Crusher) boss background for headless (was: 0-monster free win)");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch Kaiser Crab: {ex.Message}");
         }
     }
 
@@ -3672,6 +3734,32 @@ public partial class RunSimulator
         {
             __result = null;
             return false; // Skip original method
+        }
+    }
+
+    internal static class KaiserCrabPatches
+    {
+        // Allocated without running any constructor (no Godot node init); the only method
+        // ever called on it that isn't separately no-op'd is CanvasItem.SetVisible (a stub
+        // bool setter). Its Play* methods are patched out because they deref a null
+        // _animController in headless.
+        private static MegaCrit.Sts2.Core.Nodes.Vfx.Backgrounds.NKaiserCrabBossBackground? _dummy;
+
+        public static bool BackgroundPrefix(
+            ref MegaCrit.Sts2.Core.Nodes.Vfx.Backgrounds.NKaiserCrabBossBackground __result)
+        {
+            __result = _dummy ??= (MegaCrit.Sts2.Core.Nodes.Vfx.Backgrounds.NKaiserCrabBossBackground)
+                System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(
+                    typeof(MegaCrit.Sts2.Core.Nodes.Vfx.Backgrounds.NKaiserCrabBossBackground));
+            return false; // Skip the original getter (which throws in headless)
+        }
+
+        public static bool SkipVoid() => false; // skip original void anim method
+
+        public static bool SkipTask(ref Task __result)
+        {
+            __result = Task.CompletedTask;
+            return false; // skip original async anim method
         }
     }
 

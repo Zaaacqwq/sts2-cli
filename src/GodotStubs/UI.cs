@@ -8,6 +8,12 @@ public class CanvasItem : Node
     public bool Visible { get; set; } = true;
     public virtual void Show() => Visible = true;
     public virtual void Hide() => Visible = false;
+    // Godot binds the Visible property to SetVisible/IsVisible methods; game code
+    // (e.g. Crusher.AfterAddedToRoom, the Kaiser Crab boss) calls SetVisible(bool)
+    // directly. Without this stub the spawn throws MissingMethodException, which
+    // CombatManager swallows — the monster never spawns and the boss is a free win.
+    public void SetVisible(bool visible) => Visible = visible;
+    public bool IsVisible() => Visible;
     public bool IsVisibleInTree() => Visible;
     public Tween CreateTween() => new Tween();
     public Rect2 GetViewportRect() => new Rect2(Vector2.Zero, new Vector2(1920, 1080));
