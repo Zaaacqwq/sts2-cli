@@ -1118,12 +1118,15 @@ public partial class RunSimulator
         return p?.PlayerCombatState?.Phase == MegaCrit.Sts2.Core.Combat.PlayerTurnPhase.Play;
     }
 
+    private bool HasPendingSelection() =>
+        _cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null;
+
     private Dictionary<string, object?> DoEndTurn(Player player)
     {
         // A pending card / card-reward / bundle selection is an unresolved prompt; ending
         // the turn here would silently mutate combat instead. Surface the prompt unchanged
         // and let the caller resolve it first (#61).
-        if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
+        if (HasPendingSelection())
         {
             Log("end_turn ignored: a card selection is pending");
             return DetectDecisionPoint();
@@ -1171,6 +1174,7 @@ public partial class RunSimulator
                     _syncCtx.Pump();
                     if (_turnStarted.IsSet || _combatEnded.IsSet) break;
                     if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
+                    if (HasPendingSelection()) break;
                     if (IsPlayPhase()) break;
                     Thread.Sleep(5);
                 }
@@ -1181,9 +1185,23 @@ public partial class RunSimulator
             YieldPatches.SuppressYield = false;
         }
 
+        // An enemy move can open a prompt mid-enemy-turn: Knowledge Demon's
+        // CURSE_OF_KNOWLEDGE_MOVE makes the player pick one of two debuffs, and the
+        // engine blocks the enemy turn on that selection. That is a legitimate pause,
+        // not a deadlock — without this yield the fallbacks below read "not play phase"
+        // as stuck, and their EndTurn retries throw "EndPlayerTurn called while the
+        // current side is Enemy!" until the nuclear path forces a game_over. Every
+        // Knowledge Demon fight was a scripted round-1 loss at full HP.
+        if (HasPendingSelection())
+        {
+            Log("end_turn yielded: enemy move opened a card selection");
+            return DetectDecisionPoint();
+        }
+
         // Second fallback: if still stuck after SuppressYield window, cancel and retry.
         // The WaitUntilQueue TCS is likely deadlocked.
-        if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead)
+        if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead
+            && !HasPendingSelection())
         {
             Log("EndTurn stuck, cancelling and retrying with SuppressYield...");
             try
@@ -1213,6 +1231,7 @@ public partial class RunSimulator
                     _syncCtx.Pump();
                     if (_turnStarted.IsSet || _combatEnded.IsSet) break;
                     if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
+                    if (HasPendingSelection()) break;
                     if (IsPlayPhase()) break;
                     Thread.Sleep(10);
                 }
@@ -1221,7 +1240,8 @@ public partial class RunSimulator
 
             // NUCLEAR OPTION: If STILL stuck after 2 attempts, use ThreadPool to force
             // the enemy turn processing to complete with SuppressYield permanently on.
-            if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead)
+            if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead
+                && !HasPendingSelection())
             {
                 var stuckState = CombatManager.Instance.DebugOnlyGetState();
                 var stuckEnemies = stuckState?.Enemies?.Where(e => e != null && e.IsAlive)
@@ -1252,24 +1272,27 @@ public partial class RunSimulator
                         _syncCtx.Pump();
                         if (_turnStarted.IsSet || _combatEnded.IsSet) break;
                         if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
+                        if (HasPendingSelection()) break;
                         if (IsPlayPhase()) break;
                         Thread.Sleep(10);
                     }
                     YieldPatches.SuppressYield = false;
 
                     // If still not play phase, try just waiting a bit more
-                    if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead)
+                    if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead
+                        && !HasPendingSelection())
                     {
                         for (int i = 0; i < 200; i++)
                         {
                             _syncCtx.Pump();
                             Thread.Sleep(10);
+                            if (HasPendingSelection()) break;
                             if (IsPlayPhase() || !CombatManager.Instance.IsInProgress || player.Creature.IsDead)
                                 break;
                         }
                     }
 
-                    if (IsPlayPhase())
+                    if (IsPlayPhase() || HasPendingSelection())
                         Log("Nuclear fallback SUCCEEDED — play phase resumed");
                     else
                     {
@@ -1577,6 +1600,9 @@ public partial class RunSimulator
     {
         if (_cardSelector.HasPending)
         {
+            // Mirror the reported min_select: an enemy-forced choice is not skippable.
+            if (EffectiveMinSelect((_cardSelector.PendingOptions ?? new List<CardModel>()).Count) >= 1)
+                return Error("This selection is mandatory (min_select >= 1); use select_cards");
             Log("Skipping card selection");
             _cardSelector.CancelPending();
             _syncCtx.Pump();
@@ -1982,7 +2008,7 @@ public partial class RunSimulator
                 ["decision"] = "card_select",
                 ["context"] = RunContext(),
                 ["cards"] = opts,
-                ["min_select"] = _cardSelector.PendingMinSelect,
+                ["min_select"] = EffectiveMinSelect(opts.Count),
                 ["max_select"] = _cardSelector.PendingMaxSelect,
                 ["player"] = PlayerSummary(player),
             };
@@ -3046,9 +3072,26 @@ public partial class RunSimulator
         return new Dictionary<string, object?>
         {
             ["type"] = "decision", ["decision"] = "card_select", ["context"] = RunContext(),
-            ["cards"] = opts, ["min_select"] = _cardSelector.PendingMinSelect,
+            ["cards"] = opts, ["min_select"] = EffectiveMinSelect(opts.Count),
             ["max_select"] = _cardSelector.PendingMaxSelect, ["player"] = PlayerSummary(player)
         };
+    }
+
+    /// <summary>
+    /// A selection opened while combat is running and the player is NOT in the Play phase was
+    /// forced on the player by an enemy move — Knowledge Demon's CURSE_OF_KNOWLEDGE makes you take
+    /// one of two debuffs. The game passes minSelect=0 for these (its own UI is what makes the
+    /// choice mandatory: the screen cannot be dismissed), so reporting 0 verbatim let a headless
+    /// caller `skip_select` and decline the curse outright — taking zero Disintegration. Anything
+    /// the player opens themselves happens in the Play phase (Armaments, Headbutt) or out of combat
+    /// (shop, rest, event) and keeps the engine's own minimum.
+    /// </summary>
+    private int EffectiveMinSelect(int optionCount)
+    {
+        var raw = _cardSelector.PendingMinSelect;
+        if (optionCount > 0 && CombatManager.Instance.IsInProgress && !IsPlayPhase())
+            return Math.Max(raw, 1);
+        return raw;
     }
 
     private void WaitForActionExecutor()
